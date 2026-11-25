@@ -1,4 +1,9 @@
 {
+  "scripts": {
+    "backup": "node worker/scripts/backup.mjs",
+    "check:upstream": "node worker/scripts/check-upstream.mjs",
+    "deploy": "npm --prefix worker run deploy"
+  },
   "devDependencies": {
     "js-yaml": "^4.1.0"
   }

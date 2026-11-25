@@ -1,0 +1,25 @@
+{
+  "_comment": "Upstream API routes this Cloudflare deployment deliberately does not serve, by path prefix, with why. The app treats them as an upstream server with that feature turned off. pnpm check:upstream flags any upstream route that is neither served by worker/src nor covered here. Keep reasons short; docs/cloudflare-migration/STAYING_UP_TO_DATE.md explains them.",
+  "prefixes": {
+    "/api/account/email": "password and email sign-in are off (passkeys only)",
+    "/api/account/password": "password sign-in is off (passkeys only)",
+    "/api/login/password": "password sign-in is off (passkeys only)",
+    "/api/register/password": "password sign-in is off (passkeys only)",
+    "/api/admin/user/password-reset": "password sign-in is off (passkeys only)",
+    "/api/oidc/": "provider (OIDC) sign-in is off",
+    "/api/admin/oidc": "provider (OIDC) sign-in is off",
+    "/api/admin/coach/chatgpt/": "the AI Coach is off (COACH_DISABLED=1)",
+    "/api/media/": "photos and videos of custom exercises are off (needs R2)",
+    "/api/push/": "Web Push in the browser is off (the phone apps notify on their own)",
+    "/api/sharing": "sharing between profiles is off",
+    "/api/admin/users/:p/sharing": "sharing between profiles is off",
+    "/api/shared": "the community library is off",
+    "/api/admin/shared": "the community library is off",
+    "/api/trainer": "trainers and gyms are off",
+    "/api/gym": "trainers and gyms are off",
+    "/api/admin/gyms": "trainers and gyms are off",
+    "/api/admin/user/trainer": "trainers and gyms are off",
+    "/api/watch/": "the server watch relay is off (the phone apps sync their watches directly)",
+    "/api/integrations/oauth/": "only the webhook integration is offered (no OAuth providers)"
+  }
+}

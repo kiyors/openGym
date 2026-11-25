@@ -5,6 +5,8 @@ payment card: the web app with its 180 px exercise media, the API the web and ph
 with, and the remote MCP endpoint (`/mcp`, OAuth or scoped tokens) for Claude, ChatGPT, Gemini and
 OpenCode. The Docker deployment in the rest of the repository is untouched.
 
+**Staying up to date with upstream, backups and limits: [STAYING_UP_TO_DATE.md](STAYING_UP_TO_DATE.md).**
+
 The design notes this started from are in this folder (`target_architecture_*`). What was built
 differs from them in a few places, listed under "Differences from the plan" below.
 

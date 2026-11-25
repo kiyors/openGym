@@ -60,3 +60,6 @@ frontend/ios/App/WatchCore/.build/
 
 # Temporary end-to-end twin of the Cloudflare Worker (docs/cloudflare-migration/README.md)
 .wrangler-e2e.jsonc
+
+# Cloudflare D1 backups (pnpm backup): personal data, never committed
+backups/

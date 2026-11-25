@@ -48,10 +48,12 @@ function walkStats(dir) {
 
 const skipInstall = process.argv.includes('--skip-install');
 
+// The pnpm workspace (pnpm-workspace.yaml) installs the web app with the Worker; upstream's own
+// npm lockfile in frontend/ stays for the Docker image.
 if (!skipInstall) {
-  run('npm', ['ci', '--ignore-scripts'], FRONTEND_DIR);
+  run('pnpm', ['install', '--frozen-lockfile'], ROOT);
 }
-run('npm', ['run', 'build'], FRONTEND_DIR);
+run('pnpm', ['run', 'build'], FRONTEND_DIR);
 run('node', [path.join(ROOT, 'scripts/catalogue/stage-media.mjs'), DIST_DIR], ROOT);
 
 writeHeaders();

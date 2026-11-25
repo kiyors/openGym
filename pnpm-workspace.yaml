@@ -1,0 +1,21 @@
+# One pnpm install for the Cloudflare deployment (docs/cloudflare-migration/README.md):
+# the Worker, the MCP tools it bundles, and the web app it serves.
+#
+# Upstream's own npm setup stays as it is: frontend/, mcp/ and api/ keep their
+# package-lock.json files, which the Docker images and upstream's CI install from, so merges
+# from upstream never conflict here. pnpm reads this file and pnpm-lock.yaml only.
+packages:
+  - worker
+  - mcp
+  - frontend
+
+# Packages whose install scripts must run: the local Workers runtime and the bundler.
+allowBuilds:
+  esbuild: true
+  workerd: true
+
+# Packages upstream's code uses without declaring them, which npm's flat node_modules happened to
+# provide: hoisted to the root so they resolve the same way (frontend's color-mix test imports
+# lightningcss, a dependency of Vite).
+publicHoistPattern:
+  - lightningcss

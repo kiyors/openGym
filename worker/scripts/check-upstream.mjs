@@ -27,7 +27,7 @@ const git = (...a) => execFileSync('git', a, { cwd: ROOT, encoding: 'utf8', maxB
 const IMPORTED = [
   'api/sync-stamps.js', 'api/nudge.js', 'api/queue.js', 'api/passkeys-store.js', 'api/verify-error.js',
   'api/rate-limit.js', 'api/integrations/events.js', 'api/integrations/calendar.js',
-  'api/coach/core/categories.js', 'api/coach/core/library-data.js', 'mcp/src/', 'mcp/package-lock.json',
+  'api/coach/core/categories.js', 'api/coach/core/library-data.js', 'mcp/src/', 'mcp/package.json', 'frontend/package.json',
 ];
 // Upstream code the Worker re-implements in worker/src: a change here may need the same change
 // made by hand on the Worker side.

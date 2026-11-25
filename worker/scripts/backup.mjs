@@ -9,7 +9,7 @@
 //   manifest.json                          what was saved: profiles, revisions, sizes, workout counts
 //
 //   pnpm backup             the deployed database
-//   pnpm backup -- --local  the `wrangler dev` database
+//   pnpm backup --local     the `wrangler dev` database
 //
 // Restoring: docs/cloudflare-migration/STAYING_UP_TO_DATE.md, "Backups".
 import { execFileSync } from 'node:child_process';
@@ -29,7 +29,7 @@ const out = path.join(ROOT, 'backups', (local ? 'local_' : '') + stamp);
 fs.mkdirSync(out, { recursive: true });
 
 function wrangler(args, { capture = false } = {}) {
-  return execFileSync('npx', ['wrangler', ...args, '-c', '../wrangler.jsonc'], {
+  return execFileSync('pnpm', ['exec', 'wrangler', ...args, '-c', '../wrangler.jsonc'], {
     cwd: WORKER,
     stdio: ['ignore', capture ? 'pipe' : 'ignore', 'inherit'],
     encoding: 'utf8',

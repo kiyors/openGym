@@ -51,6 +51,7 @@ To keep that work small, the Worker reuses upstream's code wherever it can run u
 Ours alone, so upstream never touches it and a merge never conflicts there:
 
 ```
+pnpm-workspace.yaml, pnpm-lock.yaml  one pnpm install for worker/, mcp/ and frontend/
 worker/                              the Worker (API + MCP host), its tests and scripts
 wrangler.jsonc                       Cloudflare configuration (account, database, settings)
 scripts/build-worker-assets.mjs      builds the web app and stages the media for Cloudflare
@@ -63,7 +64,7 @@ Upstream files we changed (the only places a merge can conflict):
 | File | Change |
 | --- | --- |
 | `mcp/src/api-client.js` | one line: the MCP tools use the Worker's own router instead of the network |
-| `package.json` (repository root) | the `backup`, `check:upstream` and `deploy` scripts |
+| `package.json` (repository root) | the fork's commands (`pnpm backup`, `pnpm cf:deploy`, ...) |
 | `.gitignore` | `.dev.vars`, `backups/`, a test config |
 
 If a merge conflicts in one of them, keep upstream's version and put our small change back on top.
@@ -93,7 +94,7 @@ So a new phone app version can start calling an API route that your Worker does 
 that one feature fails in the app, while everything else keeps working. Two habits prevent it:
 
 1. **When upstream releases a new version** (a new tag on GitHub, or the app updates on your
-   phone), run `pnpm check:upstream -- --ref <the new tag>`. It lists any new API route.
+   phone), run `pnpm check:upstream --ref <the new tag>`. It lists any new API route.
 2. Merge and deploy the update soon after, using the steps below.
 
 Sync itself is the safest part: the profile is one JSON document, so new fields that new app
@@ -132,36 +133,33 @@ git merge upstream/main
 #    then re-apply our small change.
 
 # 3. Install what changed
-(cd mcp && npm ci --ignore-scripts)
-(cd worker && npm ci)
+pnpm install             # updates pnpm-lock.yaml if upstream changed a package.json
 
 # 4. Check, then test against a local copy (never against the real server: the test makes
 #    profiles)
-(cd worker && npm run typecheck)
-pnpm check:upstream -- --ref HEAD --no-fetch     # the merged code, nothing missing
-(cd mcp && npx vitest run)                       # upstream's MCP tests still pass
+pnpm typecheck
+pnpm check:upstream --ref HEAD --no-fetch       # the merged code, nothing missing
+pnpm --dir mcp exec vitest run                  # upstream's MCP tests still pass
 ```
 
 Running the end-to-end test locally:
 
 ```bash
-cd worker
-npm run db:migrate:local
-rsync -a --delete --exclude exercise-media ../frontend/dist/ /tmp/og-assets/
-npx wrangler dev -c ../wrangler.jsonc --assets /tmp/og-assets &
-INVITE=$(npm run -s invite -- --local | awk '{print $NF}') npm run e2e
+pnpm build:assets
+pnpm cf:migrate:local
+pnpm cf:dev &                                    # or in a second terminal
+INVITE=$(pnpm -s invite --local | awk '{print $NF}') pnpm e2e
 ```
 
 It runs 20 checks the way the apps use the server: passkey sign-up and sign-in, sync and conflict
 handling, phone pairing, tokens, MCP reads and writes, webhooks, calendar, admin. All 20 must pass.
-(Build the web app first, step 5, if `frontend/dist` is missing or old.)
+(`pnpm build:assets` takes a few minutes; it is the same build step 5 deploys.)
 
 ```bash
 # 5. Build and deploy
-cd worker
-npm run build:assets           # the web app and media
-npm run db:migrate:remote      # only if worker/migrations has a new file
-npm run deploy
+pnpm build:assets        # the web app and media (skip if already built in step 4)
+pnpm cf:migrate          # only if worker/migrations has a new file
+pnpm cf:deploy
 
 # 6. Confirm
 curl https://opengym.kiyors.workers.dev/api/health
@@ -171,7 +169,7 @@ curl https://opengym.kiyors.workers.dev/api/health
 git push origin main
 ```
 
-If a deploy goes wrong, `npx wrangler rollback -c ../wrangler.jsonc` (in `worker/`) puts the
+If a deploy goes wrong, `pnpm --dir worker exec wrangler rollback -c ../wrangler.jsonc` puts the
 previous version back within seconds. Data is untouched by a rollback.
 
 ## 4. Backups
@@ -189,7 +187,7 @@ Saves to `backups/<date>_<time>/` in the repository (never committed: `backups/`
 Run it before every update, and regularly besides (weekly is plenty). Keep a copy outside this
 computer too. Cloudflare also keeps the last 7 days of database history itself on the free plan
 (D1 Time Travel), for undoing a recent mistake in place:
-`npx wrangler d1 time-travel restore opengym-db --timestamp <time> -c ../wrangler.jsonc` (in `worker/`).
+`pnpm --dir worker exec wrangler d1 time-travel restore opengym-db --timestamp <time> -c ../wrangler.jsonc`.
 
 ### Restoring
 
@@ -199,12 +197,12 @@ computer too. Cloudflare also keeps the last 7 days of database history itself o
 
   ```bash
   cd worker
-  npx wrangler d1 create opengym-db-restored
+  pnpm exec wrangler d1 create opengym-db-restored
   #   in wrangler.jsonc: database_name "opengym-db-restored" and the database_id it printed
-  npx wrangler d1 execute opengym-db-restored --remote --file ../backups/<date>/opengym-db.sql -c ../wrangler.jsonc
-  npm run deploy
-  #   the npm scripts name the database opengym-db: rename it in worker/package.json and
-  #   worker/scripts/*.mjs too, or keep using the new name with npx wrangler directly
+  pnpm exec wrangler d1 execute opengym-db-restored --remote --file ../backups/<date>/opengym-db.sql -c ../wrangler.jsonc
+  pnpm run deploy
+  #   the scripts name the database opengym-db: rename it in worker/package.json and
+  #   worker/scripts/*.mjs too, or keep using the new name with pnpm exec wrangler directly
   ```
 
   Passkeys only work again at the same address (opengym.kiyors.workers.dev).
@@ -224,7 +222,7 @@ computer too. Cloudflare also keeps the last 7 days of database history itself o
 ## 6. When something breaks
 
 ```bash
-cd worker && npx wrangler tail opengym -c ../wrangler.jsonc
+pnpm --dir worker exec wrangler tail opengym -c ../wrangler.jsonc
 ```
 
 shows every request live, with the server's log lines. The Worker logs why it refused an

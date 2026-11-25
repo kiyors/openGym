@@ -2,7 +2,14 @@
   "scripts": {
     "backup": "node worker/scripts/backup.mjs",
     "check:upstream": "node worker/scripts/check-upstream.mjs",
-    "deploy": "npm --prefix worker run deploy"
+    "invite": "node worker/scripts/invite.mjs",
+    "build:assets": "node scripts/build-worker-assets.mjs",
+    "typecheck": "pnpm --dir worker run typecheck",
+    "cf:migrate": "pnpm --dir worker run db:migrate:remote",
+    "cf:migrate:local": "pnpm --dir worker run db:migrate:local",
+    "cf:deploy": "pnpm --dir worker run deploy",
+    "cf:dev": "pnpm --dir worker run dev",
+    "e2e": "node worker/test/e2e.mjs"
   },
   "devDependencies": {
     "js-yaml": "^4.1.0"

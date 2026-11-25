@@ -6,7 +6,7 @@
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "build:assets": "node ../scripts/build-worker-assets.mjs",
-    "dev": "wrangler dev -c ../wrangler.jsonc",
+    "dev": "rsync -a --delete --exclude exercise-media ../frontend/dist/ ../.wrangler/dev-assets/ && wrangler dev -c ../wrangler.jsonc --assets ../.wrangler/dev-assets",
     "deploy": "wrangler deploy -c ../wrangler.jsonc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",

@@ -50,22 +50,24 @@ Pick the hostname first. A passkey is tied to the address it was made at, so mov
 address later means making new passkeys. `RP_ID` and `ORIGIN` follow the address the Worker is
 reached at unless you set them in `wrangler.jsonc`.
 
+Everything runs from the repository root with pnpm. `pnpm install` installs the Worker, the MCP
+tools it bundles and the web app in one go (`pnpm-workspace.yaml`).
+
 ```bash
-cd mcp && npm ci --ignore-scripts && cd ..      # the MCP tools the Worker bundles
-cd worker && npm ci
-npx wrangler login
+pnpm install
+pnpm --dir worker exec wrangler login
 
-npx wrangler d1 create opengym-db               # paste the database_id into wrangler.jsonc
-npm run db:migrate:remote
-openssl rand -hex 32 | npx wrangler secret put SESSION_SECRET -c ../wrangler.jsonc
+pnpm --dir worker exec wrangler d1 create opengym-db   # its database_id goes in wrangler.jsonc
+pnpm cf:migrate
+openssl rand -hex 32 | pnpm --dir worker exec wrangler secret put SESSION_SECRET -c ../wrangler.jsonc
 
-npm run build:assets                            # builds the app, stages the media, writes _headers
-npm run deploy
-npm run invite                                  # prints an invite code for your own profile
+pnpm build:assets        # builds the app, stages the media, writes _headers
+pnpm cf:deploy
+pnpm invite              # prints an invite code for your own profile
 ```
 
 `INVITE_ONLY=1` is on from the start, so nobody can sign up before you do. Open the Worker's
-address, choose "Create profile", enter the code `npm run invite` printed and make your passkey.
+address, choose "Create profile", enter the code `pnpm invite` printed and make your passkey.
 With `FIRST_USER_ADMIN=1` that first profile is the owner and admin; invite others from the admin
 dashboard.
 
@@ -74,11 +76,12 @@ dashboard.
 Deploys run from your own machine:
 
 ```bash
-cd worker
-npm run build:assets      # only when the app or the media changed
-npm run db:migrate:remote # only when worker/migrations has a new file
-npm run deploy
+pnpm build:assets        # only when the app or the media changed
+pnpm cf:migrate          # only when worker/migrations has a new file
+pnpm cf:deploy
 ```
+
+(`pnpm deploy` is a command of pnpm's own, hence `cf:deploy`.)
 
 `.github/workflows/deploy-worker.yml` does the same on GitHub, but only when started by hand
 (Actions, "Deploy openGym to Cloudflare Workers", Run workflow), and only with two repository
@@ -102,20 +105,22 @@ calendar, admin. Its first profile becomes the owner of an empty instance, so ru
 `wrangler dev` or a separate test Worker, never your real one.
 
 ```bash
-cd worker
-npm run db:migrate:local
-npm run dev                                      # see "Local development" below
-INVITE=$(npm run -s invite -- --local | awk '{print $NF}') npm run e2e
+pnpm cf:migrate:local
+pnpm cf:dev                                       # in a second terminal, or in the background
+INVITE=$(pnpm -s invite --local | awk '{print $NF}') pnpm e2e
 ```
 
 ## Local development
 
-- `wrangler dev` watches the assets folder, and with the 13,000 exercise files in it the local
-  runtime fails to start (`spawn EBADF`). Serve the app without the media instead:
-  `rsync -a --exclude exercise-media ../frontend/dist/ /tmp/og-assets/` and
-  `npx wrangler dev -c ../wrangler.jsonc --assets /tmp/og-assets`.
-- npm 11 skips install scripts unless approved. If `wrangler dev` cannot start the runtime, run
-  `node node_modules/workerd/install.js` once inside `worker/`.
+- `pnpm cf:dev` serves the built app without the 13,000 exercise files (copied to
+  `.wrangler/dev-assets/`): `wrangler dev` cannot watch that many files, and its local runtime then
+  fails to start (`spawn EBADF`). Run `pnpm build:assets` first if `frontend/dist` is missing.
+- The local database is named after the `database_id` in `wrangler.jsonc`. After changing it, run
+  `pnpm cf:migrate:local` again.
+- pnpm runs install scripts only for packages listed under `allowBuilds` in
+  `pnpm-workspace.yaml` (the local runtime and the bundler are).
+- Upstream's `frontend/`, `mcp/` and `api/` keep their npm lockfiles for the Docker images and
+  upstream's CI. pnpm ignores them; `pnpm-lock.yaml` is this fork's.
 
 ## Differences from the plan
 
@@ -123,5 +128,5 @@ INVITE=$(npm run -s invite -- --local | awk '{print $NF}') npm run e2e
   logged workouts, a missing tool, different arguments).
 - Every write is stamped by upstream's `sync-stamps.js`, as the Docker API does. The plan proposed
   skipping it for current clients; that changes merge results.
-- No first-user bypass of `INVITE_ONLY`: `npm run invite` makes the first code instead.
+- No first-user bypass of `INVITE_ONLY`: `pnpm invite` makes the first code instead.
 - Coach, Web Push and media uploads are off (above).

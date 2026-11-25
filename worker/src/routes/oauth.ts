@@ -37,6 +37,7 @@ const REFRESH_GRACE_MS = 60_000;
 const REFRESH_PREFIX = 'ogr_';
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
 const GRANTS = ['authorization_code', 'refresh_token'];
+const MAX_REDIRECTS = 20;
 
 function redirectOk(raw: string): boolean {
   let u: URL;
@@ -125,7 +126,7 @@ async function resolveCimdClient(
     const uris = Array.isArray(doc.redirect_uris)
       ? doc.redirect_uris.filter((u): u is string => typeof u === 'string')
       : [];
-    if (!uris.length || uris.length > 10 || !uris.every(redirectOk)) {
+    if (!uris.length || uris.length > MAX_REDIRECTS || !uris.every(redirectOk)) {
       return { ok: false, error: 'no usable redirect_uris in client metadata document' };
     }
     if ((doc.token_endpoint_auth_method || 'none') !== 'none') {
@@ -225,11 +226,16 @@ oauthRoutes.post('/api/oauth/register', async (c) => {
   const uris = Array.isArray(body.redirect_uris)
     ? body.redirect_uris.filter((u): u is string => typeof u === 'string')
     : [];
-  if (!uris.length || uris.length > 5 || !uris.every(redirectOk)) {
+  // Up to 20: Google's connector registers six or more at once (sandbox, test and production
+  // hosts, each with two paths); upstream's 5 refuses it.
+  if (!uris.length || uris.length > MAX_REDIRECTS || !uris.every(redirectOk)) {
+    // Public client metadata only: which addresses a connector asked for, so a refusal can be
+    // understood from the Worker's logs (wrangler tail).
+    console.warn('[oauth] register refused', JSON.stringify({ client_name: body.client_name, redirect_uris: body.redirect_uris }).slice(0, 1000));
     return c.json(
       {
         error: 'invalid_redirect_uri',
-        error_description: 'redirect_uris: 1-5 https addresses (or http on localhost)',
+        error_description: `redirect_uris: 1-${MAX_REDIRECTS} https addresses (or http on localhost)`,
       },
       400
     );
@@ -288,7 +294,10 @@ oauthRoutes.get('/api/oauth/authorize', async (c) => {
   let client: { id: string; name: string; redirects: string[]; grants: string[]; cimd?: boolean } | null = null;
   if (isCimdId(clientId)) {
     const resolved = await resolveCimdClient(clientId);
-    if (!resolved.ok) return c.text(`openGym could not start this sign-in: ${resolved.error}`, 400);
+    if (!resolved.ok) {
+      console.warn('[oauth] client metadata refused', clientId.slice(0, 300), resolved.error);
+      return c.text(`openGym could not start this sign-in: ${resolved.error}`, 400);
+    }
     client = resolved.client;
   } else {
     const row = await c.env.DB.prepare('SELECT * FROM oauth_clients WHERE client_id = ?')
@@ -304,9 +313,13 @@ oauthRoutes.get('/api/oauth/authorize', async (c) => {
     }
   }
 
-  if (!client) return c.text('openGym could not start this sign-in: unknown client_id', 400);
+  if (!client) {
+    console.warn('[oauth] authorize unknown client', clientId.slice(0, 300));
+    return c.text('openGym could not start this sign-in: unknown client_id', 400);
+  }
   const redirect = q.get('redirect_uri') || (client.redirects.length === 1 ? client.redirects[0] : '');
   if (!client.redirects.some((r) => sameRedirect(r, redirect))) {
+    console.warn('[oauth] authorize redirect refused', JSON.stringify({ client: client.name, asked: redirect.slice(0, 300), registered: client.redirects }).slice(0, 1000));
     return c.text('openGym could not start this sign-in: redirect_uri is not registered', 400);
   }
 

@@ -48,12 +48,18 @@ mcpRoutes.all('/mcp', async (c) => {
   // Clients that are not browsers send no Origin.
   const reqOrigin = c.req.header('origin');
   if (reqOrigin && reqOrigin.replace(/\/+$/, '') !== origin) return rpcError(403, 'origin not allowed');
+  const authHeader = c.req.header('authorization') || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  // Sign-in before the method: connectors that probe with GET or HEAD first (Google's do) learn
+  // from the 401 and its WWW-Authenticate where to sign in (RFC 9728). Answered 405 instead, they
+  // conclude there is no OAuth here and ask the user for a client id and secret.
+  if (c.req.method !== 'POST' && !TOKEN_RE.test(token)) {
+    const res = unauthorized(origin, 'an openGym API token is needed (Authorization: Bearer ogt_…)');
+    return c.req.method === 'HEAD' ? new Response(null, { status: res.status, headers: res.headers }) : res;
+  }
   if (c.req.method !== 'POST') {
     return rpcError(405, 'POST only: this endpoint is stateless (no GET stream, no session to delete)', { Allow: 'POST' });
   }
-
-  const authHeader = c.req.header('authorization') || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
   if (!TOKEN_RE.test(token)) {
     return unauthorized(
       origin,

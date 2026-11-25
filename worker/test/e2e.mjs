@@ -135,7 +135,7 @@ await step('sync: empty profile, first write, conflict, stamped write', async ()
   assert.equal(stale.json.rev, 1);
   assert.ok(stale.json.state && !('active' in stale.json.state), 'in-progress workout stays device-local');
 
-  const w = { id: 'w1', d: '2026-11-20', name: 'Push', ex: [], _ts: Date.now() };
+  const w = { id: 'w1', d: '2026-11-20', name: 'Push', start: Date.parse('2026-11-20T18:00:00Z'), end: Date.parse('2026-11-20T19:00:00Z'), entries: [], _ts: Date.now() };
   const p2 = await call('/api/data', { method: 'PUT', body: { state: { ...state, workouts: [w] }, baseRev: 1, baseWid: p1.json.wid, stamped: true } });
   assert.equal(p2.status, 200, p2.text);
   assert.equal(p2.json.rev, 2);
@@ -240,7 +240,7 @@ await step('remote MCP: initialize, tools/list, tools/call', async () => {
   const recent = tools.find((t) => /recent|workouts/.test(t)) || tools[0];
   const call1 = await rpc(3, 'tools/call', { name: recent, arguments: {} });
   assert.equal(call1.status, 200, call1.text);
-  assert.ok(call1.json.result, call1.text);
+  assert.ok(call1.json.result && !call1.json.result.isError, call1.text);
 });
 
 await step('remote MCP write: log_workout lands in the app\'s own shape', async () => {
@@ -261,6 +261,28 @@ await step('remote MCP write: log_workout lands in the app\'s own shape', async 
   assert.ok(Array.isArray(w.entries) && w.entries.length === 1, 'sessions keep exercises in `entries`');
   assert.equal(w.entries[0].sets.length, 2);
   assert.ok(d.json.rev >= 3, 'the write moved the revision');
+});
+
+await step('remote MCP sees a change made in the app right after (no stale cached profile)', async () => {
+  const listDates = async () => {
+    const r = await fetch(BASE + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', Authorization: 'Bearer ' + apiToken },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'list_workouts', arguments: {} } }),
+    });
+    return (await r.json()).result.content[0].text;
+  };
+  assert.ok(!(await listDates()).includes('2026-11-23'));
+  const d = await call('/api/data');
+  const state = d.json.state;
+  // A real app record: the session log_workout saved above, as a new one on another day.
+  const model = state.workouts.find((w) => w.d === '2026-11-21');
+  const day = Date.parse('2026-11-23T18:00:00Z') - Date.parse(model.d + 'T18:00:00Z');
+  state.workouts.push({ ...structuredClone(model), id: 'w-app-' + Date.now(), d: '2026-11-23', start: model.start + day, end: model.end + day, _ts: Date.now() });
+  const p = await call('/api/data', { method: 'PUT', body: { state, baseRev: d.json.rev, baseWid: d.json.state._wid, stamped: true } });
+  assert.equal(p.status, 200, p.text);
+  const after = await listDates();
+  assert.ok(after.includes('2026-11-23'), 'the MCP answer includes the workout the app just saved: ' + after.slice(0, 600));
 });
 
 await step('webhooks: connect reveals the secret once, list and log shapes', async () => {

@@ -4,7 +4,7 @@
 import { Hono } from 'hono';
 import { Env, flagOn, resolveOrigin } from '../env';
 import { authenticateApiToken } from './tokens';
-import type { SelfFetch } from '../mcp-bridge';
+import { handleMcp, type SelfFetch } from '../mcp-bridge';
 
 export const mcpRoutes = new Hono<{ Bindings: Env }>();
 
@@ -85,7 +85,6 @@ mcpRoutes.all('/mcp', async (c) => {
   // The transport reads the body itself; it gets a fresh copy of the request.
   const req = new Request(c.req.raw.url, { method: 'POST', headers: c.req.raw.headers, body });
   try {
-    const { handleMcp } = await import('../mcp-bridge');
     const res = await handleMcp(req, { base: origin, token, selfFetch });
     if (res.status >= 400) {
       // What the transport refused and why, never the token: the protocol version, the JSON-RPC

@@ -3,6 +3,8 @@
 {
   "$schema": "worker/node_modules/wrangler/config-schema.json",
   "name": "opengym",
+  // The kiyors Cloudflare account (wrangler is signed in to several; not a secret).
+  "account_id": "b6659ee14f1c076022641fdf51883c0c",
   "main": "worker/src/index.ts",
   "compatibility_date": "2026-11-01",
   "compatibility_flags": ["nodejs_compat"],

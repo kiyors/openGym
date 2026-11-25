@@ -87,6 +87,27 @@ mcpRoutes.all('/mcp', async (c) => {
   try {
     const { handleMcp } = await import('../mcp-bridge');
     const res = await handleMcp(req, { base: origin, token, selfFetch });
+    if (res.status >= 400) {
+      // What the transport refused and why, never the token: the protocol version, the JSON-RPC
+      // method(s) and the SDK's own error text (wrangler tail).
+      let methods = '';
+      try {
+        const m = JSON.parse(new TextDecoder().decode(body));
+        methods = (Array.isArray(m) ? m : [m]).map((x) => x && x.method).join(',');
+      } catch {
+        methods = 'unparsable';
+      }
+      const text = await res.clone().text();
+      console.warn('[mcp] refused', JSON.stringify({
+        status: res.status,
+        methods,
+        version: c.req.header('mcp-protocol-version') || null,
+        accept: c.req.header('accept') || null,
+        contentType: c.req.header('content-type') || null,
+        session: c.req.header('mcp-session-id') ? 'present' : null,
+        answer: text.slice(0, 300),
+      }));
+    }
     const out = new Response(res.body, res);
     out.headers.set('Cache-Control', 'no-store');
     return out;

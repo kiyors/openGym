@@ -1,0 +1,47 @@
+// openGym on Cloudflare Workers Free Tier (Web PWA + API + Merged Remote MCP + D1)
+// Setup guide: docs/cloudflare-migration/README.md
+{
+  "$schema": "worker/node_modules/wrangler/config-schema.json",
+  "name": "opengym",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "assets": {
+    "directory": "./frontend/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/mcp", "/mcp/*", "/.well-known/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "opengym-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "worker/migrations"
+    }
+  ],
+  // Optional: uncomment if you later enable custom exercise photo/video uploads (MEDIA_UPLOADS=1).
+  // Note: R2 has a 10 GB/month free tier, but requires a payment method on file in Cloudflare.
+  // "r2_buckets": [
+  //   {
+  //     "binding": "MEDIA",
+  //     "bucket_name": "opengym-media"
+  //   }
+  // ],
+  "vars": {
+    // Leave RP_ID and ORIGIN unset to auto-derive from your *.workers.dev hostname at runtime.
+    // Once you pick your permanent hostname, you may optionally pin them here.
+    "RP_NAME": "openGym",
+    "SESSION_DAYS": "90",
+    "FIRST_USER_ADMIN": "1",
+    "INVITE_ONLY": "1",
+    "ALLOW_GUEST": "0",
+    "PASSWORD_LOGIN": "0",
+    "API_TOKENS": "1",
+    "MCP": "on",
+    "MEDIA_UPLOADS": "0",
+    "INTEGRATIONS": "webhook",
+    "AUDIT_LOG": "1"
+  }
+}

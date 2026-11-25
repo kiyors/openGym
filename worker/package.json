@@ -1,0 +1,26 @@
+{
+  "name": "opengym-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "scripts": {
+    "build:assets": "node ../scripts/build-worker-assets.mjs",
+    "dev": "wrangler dev -c ../wrangler.jsonc",
+    "deploy": "wrangler deploy -c ../wrangler.jsonc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "db:migrate:local": "wrangler d1 migrations apply opengym-db --local -c ../wrangler.jsonc",
+    "db:migrate:remote": "wrangler d1 migrations apply opengym-db --remote -c ../wrangler.jsonc"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^13.3.3",
+    "hono": "^4.7.10"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250408.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2",
+    "wrangler": "^4.14.0"
+  }
+}

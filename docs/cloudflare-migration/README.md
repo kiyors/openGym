@@ -67,12 +67,21 @@ address, choose "Create profile", enter the code `npm run invite` printed and ma
 With `FIRST_USER_ADMIN=1` that first profile is the owner and admin; invite others from the admin
 dashboard.
 
-## Automatic deploys
+## Deploying again
 
-`.github/workflows/deploy-worker.yml` runs on every push to `main`: typecheck, build, D1
-migrations, deploy. It needs two repository secrets (Settings, Secrets and variables, Actions):
-`CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit, D1: Edit) and `CLOUDFLARE_ACCOUNT_ID`. Without them
-it stops after the build.
+Deploys run from your own machine:
+
+```bash
+cd worker
+npm run build:assets      # only when the app or the media changed
+npm run db:migrate:remote # only when worker/migrations has a new file
+npm run deploy
+```
+
+`.github/workflows/deploy-worker.yml` does the same on GitHub, but only when started by hand
+(Actions, "Deploy openGym to Cloudflare Workers", Run workflow), and only with two repository
+secrets set: `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit, D1: Edit) and `CLOUDFLARE_ACCOUNT_ID`.
+Without them it stops after the build.
 
 ## Connecting
 

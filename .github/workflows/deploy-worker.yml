@@ -3,11 +3,11 @@ name: Deploy openGym to Cloudflare Workers
 # The Cloudflare Worker deployment (docs/cloudflare-migration/README.md): typecheck, build the
 # app with its 180 px exercise media, apply pending D1 migrations, deploy. Without the two
 # Cloudflare secrets it stops after the build, so forks without an account still get the checks.
+#
+# Manual only for now: deploys are built and run locally (npm run build:assets, npm run deploy).
+# To deploy on every push again, add `push: branches: [main]` under `on`.
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 concurrency:

@@ -188,10 +188,15 @@ export async function takeEphemeral<T = Record<string, unknown>>(
   code: string,
   kind: string
 ): Promise<{ code: string; uid: string | null; payload: T; expires_at: number } | null> {
-  const row = await peekEphemeral<T>(env, code, kind);
+  // One statement: of two requests racing for the same code (an OAuth code, a pairing code),
+  // only the one whose DELETE removed the row gets it.
+  const row = await env.DB.prepare(
+    'DELETE FROM ephemeral_codes WHERE code = ? AND kind = ? AND expires_at > ? RETURNING code, uid, payload_json, expires_at'
+  )
+    .bind(code, kind, Date.now())
+    .first<{ code: string; uid: string | null; payload_json: string; expires_at: number }>();
   if (!row) return null;
-  await env.DB.prepare('DELETE FROM ephemeral_codes WHERE code = ?').bind(code).run();
-  return row;
+  return { code: row.code, uid: row.uid, payload: JSON.parse(row.payload_json) as T, expires_at: row.expires_at };
 }
 
 export async function pruneExpiredEphemeral(env: Env): Promise<void> {

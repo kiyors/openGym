@@ -12,7 +12,7 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
-export function base64UrlToBytes(input: string): Uint8Array {
+export function base64UrlToBytes(input: string): Uint8Array<ArrayBuffer> {
   const pad = input.length % 4 === 0 ? '' : '='.repeat(4 - (input.length % 4));
   const b64 = input.replace(/-/g, '+').replace(/_/g, '/') + pad;
   const bin = atob(b64);

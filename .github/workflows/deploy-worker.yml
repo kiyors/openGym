@@ -1,5 +1,9 @@
 name: Deploy openGym to Cloudflare Workers
 
+# The Cloudflare Worker deployment (docs/cloudflare-migration/README.md): typecheck, build the
+# app with its 180 px exercise media, apply pending D1 migrations, deploy. Without the two
+# Cloudflare secrets it stops after the build, so forks without an account still get the checks.
+
 on:
   push:
     branches:
@@ -8,11 +12,14 @@ on:
 
 concurrency:
   group: cloudflare-worker-deploy
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      # `secrets` cannot be read in a step's `if:`; whether they are set can, through env.
+      HAS_CLOUDFLARE: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,21 +29,21 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install Worker dependencies
-        working-directory: worker
-        run: npm install
-
-      - name: Typecheck & test Worker
-        working-directory: worker
+      - name: Install Worker and MCP dependencies
         run: |
-          npm run typecheck
-          npm test
+          npm ci --prefix worker
+          # The remote MCP runs upstream's own tools from mcp/src (worker/src/mcp-bridge.ts).
+          npm ci --prefix mcp --ignore-scripts
 
-      - name: Build React PWA & stage 180 px exercise media (<20,000 files check)
+      - name: Typecheck Worker
+        working-directory: worker
+        run: npm run typecheck
+
+      - name: Build the app and stage the 180 px exercise media (under 20,000 files)
         run: node scripts/build-worker-assets.mjs
 
-      - name: Apply D1 migrations & deploy to Cloudflare Workers
-        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+      - name: Apply D1 migrations and deploy
+        if: env.HAS_CLOUDFLARE == 'true'
         working-directory: worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

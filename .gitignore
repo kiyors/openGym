@@ -56,3 +56,7 @@ frontend/ios/App/WatchCore/.build/
 /dist/
 .wrangler/
 .taste-skill/
+.dev.vars
+
+# Temporary end-to-end twin of the Cloudflare Worker (docs/cloudflare-migration/README.md)
+.wrangler-e2e.jsonc

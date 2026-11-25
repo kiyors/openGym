@@ -54,6 +54,8 @@ if (!skipInstall) {
 run('npm', ['run', 'build'], FRONTEND_DIR);
 run('node', [path.join(ROOT, 'scripts/catalogue/stage-media.mjs'), DIST_DIR], ROOT);
 
+writeHeaders();
+
 const stats = walkStats(DIST_DIR);
 const mb = (stats.totalBytes / (1024 * 1024)).toFixed(1);
 const maxMb = (stats.maxBytes / (1024 * 1024)).toFixed(2);
@@ -77,4 +79,43 @@ if (stats.maxBytes > MAX_FILE_BYTES) {
 
 function largestFileOrNone(name) {
   return name || 'none';
+}
+
+// The headers web/nginx.conf.template sets, as a Workers Static Assets `_headers` file. The
+// Content-Security-Policy is read from web/Dockerfile so the two deployments cannot drift apart.
+// These apply to static files only; the Worker's own /api answers set theirs in worker/src.
+function writeHeaders() {
+  const dockerfile = fs.readFileSync(path.join(ROOT, 'web/Dockerfile'), 'utf8');
+  const m = /ENV CONTENT_SECURITY_POLICY="([^"]+)"/.exec(dockerfile);
+  if (!m) {
+    console.error('ERROR: could not read CONTENT_SECURITY_POLICY from web/Dockerfile');
+    process.exit(1);
+  }
+  const lines = [
+    '/*',
+    '  X-Frame-Options: DENY',
+    '  X-Content-Type-Options: nosniff',
+    '  Referrer-Policy: same-origin',
+    `  Content-Security-Policy: ${m[1]}`,
+    '',
+    // Vite's hashed bundles never change under the same name.
+    '/assets/*',
+    '  Cache-Control: public, max-age=31536000, immutable',
+    '',
+    '/exercise-media/*',
+    '  Cache-Control: public, max-age=2592000, immutable',
+    '  Cross-Origin-Resource-Policy: same-origin',
+    '',
+    // The service worker, manifest and index must be re-checked on every load, or an update
+    // never reaches an installed PWA.
+    '/sw.js',
+    '  Cache-Control: no-cache, must-revalidate',
+    '/manifest.json',
+    '  Cache-Control: no-cache, must-revalidate',
+    '/index.html',
+    '  Cache-Control: no-cache, must-revalidate',
+    '',
+  ];
+  fs.writeFileSync(path.join(DIST_DIR, '_headers'), lines.join('\n'));
+  console.log('Wrote frontend/dist/_headers');
 }

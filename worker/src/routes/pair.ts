@@ -12,12 +12,15 @@ import {
   writeAudit,
 } from '../db';
 import { proveOwnerPasskey } from './auth';
+import { throttle } from '../lib/throttle';
 
 export const pairRoutes = new Hono<{ Bindings: Env }>();
 
 const PAIR_TTL_MS = 5 * 60_000;
 
 pairRoutes.post('/api/pair/create', async (c) => {
+  const limited = throttle(c, null);
+  if (limited) return limited;
   const s = await getSessionFromRequest(c.env, c.req.raw);
   if (!s) return c.json({ error: 'not signed in' }, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;

@@ -10,7 +10,10 @@ import type {
   AuthenticatorTransportFuture,
   RegistrationResponseJSON,
 } from '@simplewebauthn/server';
-import { Env, flagOn, resolveOrigin, resolveRpId, resolveRpName } from '../env';
+import { Env, adminUidSet, flagOn, resolveOrigin, resolveRpId, resolveRpName } from '../env';
+import { MAX_PASSKEYS, passkeyName, transportsOf } from '../../../api/passkeys-store.js';
+import { isMisconfigured, verifyError } from '../../../api/verify-error.js';
+import { addressPaused, strikeAddress, throttle } from '../lib/throttle';
 import { base64UrlToBytes, bytesToBase64Url, randomBase64Url, randomCode, sha256Hex } from '../crypto';
 import {
   PasskeyRow,
@@ -31,7 +34,6 @@ import {
 
 export const authRoutes = new Hono<{ Bindings: Env }>();
 
-const MAX_PASSKEYS = 10;
 const CHALLENGE_TTL_MS = 5 * 60_000;
 const DEVICE_LINK_TTL_MS = 10 * 60_000;
 
@@ -48,13 +50,88 @@ async function listUserPasskeys(env: Env, uid: string): Promise<PasskeyRow[]> {
   return res.results || [];
 }
 
+const SIGNED_OUT = { error: 'not signed in' };
+const LAST_ADMIN = { error: 'the last admin cannot leave while other profiles remain', code: 'last-admin' };
+
+function parseTransports(json: string | null): string[] {
+  if (!json) return [];
+  try {
+    return transportsOf(JSON.parse(json));
+  } catch {
+    return [];
+  }
+}
+
+// A failed verification as the answer's body. Never e.message: it can echo attacker-supplied
+// response fields. A wrong address gets the same code as the origin check's 403.
+function verifyAnswer(env: Env, req: Request, e: unknown) {
+  const origin = resolveOrigin(env, req);
+  return {
+    error: verifyError(e, { rpId: resolveRpId(env, req), origin }) as string,
+    ...(isMisconfigured(e) ? { code: 'origin-mismatch', expected: origin } : {}),
+  };
+}
+
+// As upstream: the admin counts every profile through isAdmin, so ADMIN_UIDS counts too.
+async function lastAdminLeaving(env: Env, user: UserRow): Promise<boolean> {
+  if (!isAdmin(env, user)) return false;
+  const res = await env.DB.prepare('SELECT uid, is_admin FROM users').all<{ uid: string; is_admin: number }>();
+  const rows = res.results || [];
+  if (rows.length <= 1) return false;
+  const ids = adminUidSet(env);
+  return rows.filter((r) => r.is_admin === 1 || ids.has(r.uid)).length <= 1;
+}
+
+// Whether the session is still the one that started the request: a sign-out everywhere or a
+// disable can land while a passkey proof is being verified.
+async function stillSignedIn(env: Env, req: Request, uid: string): Promise<boolean> {
+  const again = await getSessionFromRequest(env, req);
+  return !!again && again.user.uid === uid;
+}
+
+const PASSKEY_LIMIT = { error: `a profile can have at most ${MAX_PASSKEYS} passkeys`, code: 'passkey-limit' };
+
+const CREDENTIAL_EXISTS = { error: 'credential already registered', code: 'credential-exists' };
+
+interface NewPasskey {
+  credentialId: string;
+  uid: string;
+  publicKey: Uint8Array;
+  counter: number;
+  deviceType: string | null;
+  backedUp: boolean;
+  transports: unknown;
+  label: string | null;
+  now: string;
+}
+
+// An INSERT that lands only while `guard` holds, so the check and the write are one statement.
+function insertPasskey(env: Env, k: NewPasskey, guard = '1', guardBinds: unknown[] = []) {
+  return env.DB.prepare(
+    `INSERT INTO passkeys (credential_id, uid, public_key, counter, device_type, backed_up, transports_json, label, created_at, last_used_at)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${guard}`
+  ).bind(
+    k.credentialId,
+    k.uid,
+    bytesToBase64Url(k.publicKey),
+    k.counter || 0,
+    k.deviceType || null,
+    k.backedUp ? 1 : 0,
+    JSON.stringify(transportsOf(k.transports)),
+    k.label,
+    k.now,
+    k.now,
+    ...guardBinds
+  );
+}
+
 function formatPasskeys(rows: PasskeyRow[]) {
   return rows.map((r) => ({
     id: r.credential_id,
     name: r.label || null,
     created: r.created_at,
     lastUsed: r.last_used_at,
-    transports: r.transports_json ? (JSON.parse(r.transports_json) as string[]) : [],
+    transports: parseTransports(r.transports_json),
   }));
 }
 
@@ -100,7 +177,7 @@ export async function proveOwnerPasskey(
         publicKey: base64UrlToBytes(cred.public_key),
         counter: cred.counter,
         transports: cred.transports_json
-          ? (JSON.parse(cred.transports_json) as AuthenticatorTransportFuture[])
+          ? (parseTransports(cred.transports_json) as AuthenticatorTransportFuture[])
           : undefined,
       },
     });
@@ -124,14 +201,9 @@ authRoutes.post('/api/register/options', async (c) => {
   if (!name) return c.json({ error: 'name required' }, 400);
 
   const inviteOnly = flagOn(c.env.INVITE_ONLY, false);
-  const firstUserAdmin = flagOn(c.env.FIRST_USER_ADMIN, false);
   const code = textField(body.code).trim().toUpperCase();
 
-  // Allow first user to register without an invite code when FIRST_USER_ADMIN=1 and 0 users exist
-  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS cnt FROM users').first<{ cnt: number }>();
-  const isFirstBootstrap = firstUserAdmin && (countRow?.cnt ?? 0) === 0;
-
-  if (inviteOnly && !isFirstBootstrap) {
+  if (inviteOnly) {
     const inv = await c.env.DB.prepare(
       'SELECT code FROM invites WHERE code = ? AND used_by IS NULL AND revoked = 0'
     )
@@ -147,7 +219,7 @@ authRoutes.post('/api/register/options', async (c) => {
   const options = await generateRegistrationOptions({
     rpName: resolveRpName(c.env),
     rpID: resolveRpId(c.env, c.req.raw),
-    userID: new TextEncoder().encode(uid),
+    userID: new Uint8Array(new TextEncoder().encode(uid)),
     userName: name,
     userDisplayName: name,
     attestationType: 'none',
@@ -198,7 +270,7 @@ authRoutes.post('/api/register/verify', async (c) => {
       name: ch.payload.name,
       msg: 'verify-error',
     });
-    return c.json({ error: (e as Error)?.message || 'verification failed' }, 400);
+    return c.json(verifyAnswer(c.env, c.req.raw, e), 400);
   }
 
   if (!verification.verified || !verification.registrationInfo) {
@@ -210,16 +282,14 @@ authRoutes.post('/api/register/verify', async (c) => {
     .bind(credential.id)
     .first();
   if (existingCred) {
-    return c.json({ error: 'credential already registered' }, 409);
+    return c.json(CREDENTIAL_EXISTS, 409);
   }
 
-  const countRow = await c.env.DB.prepare('SELECT COUNT(*) AS cnt FROM users').first<{ cnt: number }>();
-  const isFirst = (countRow?.cnt ?? 0) === 0;
   const firstUserAdmin = flagOn(c.env.FIRST_USER_ADMIN, false);
   const inviteOnly = flagOn(c.env.INVITE_ONLY, false);
 
   let usedInvite: string | null = null;
-  if (inviteOnly && !(firstUserAdmin && isFirst)) {
+  if (inviteOnly) {
     const inv = await c.env.DB.prepare(
       'SELECT code FROM invites WHERE code = ? AND used_by IS NULL AND revoked = 0'
     )
@@ -232,38 +302,57 @@ authRoutes.post('/api/register/verify', async (c) => {
   }
 
   const nowIso = new Date().toISOString();
-  const isAdminFlag = firstUserAdmin && isFirst ? 1 : 0;
-  const isOwnerFlag = isAdminFlag;
 
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `INSERT INTO users (uid, username, session_version, is_admin, is_owner, disabled, invited_by, created_at)
-       VALUES (?, ?, 1, ?, ?, 0, ?, ?)`
-    ).bind(ch.payload.uid, ch.payload.name, isAdminFlag, isOwnerFlag, usedInvite, nowIso),
-    c.env.DB.prepare(
-      `INSERT INTO passkeys (credential_id, uid, public_key, counter, device_type, backed_up, transports_json, created_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      credential.id,
-      ch.payload.uid,
-      bytesToBase64Url(credential.publicKey),
-      credential.counter || 0,
-      credentialDeviceType || null,
-      credentialBackedUp ? 1 : 0,
-      JSON.stringify(credentialResp?.response?.transports || []),
-      nowIso,
-      nowIso
-    ),
-    ...(usedInvite
-      ? [
-          c.env.DB.prepare('UPDATE invites SET used_by = ?, used_at = ? WHERE code = ?').bind(
-            ch.payload.uid,
-            nowIso,
-            usedInvite
-          ),
-        ]
-      : []),
-  ]);
+  // One batch, and every statement guards itself: the user lands only while the invite is still
+  // unused (so two verifies with one code cannot both succeed) and is the admin only while the
+  // table is empty (so two first registrations cannot both be). SQLite serialises the batch.
+  let results;
+  try {
+    results = await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO users (uid, username, session_version, is_admin, is_owner, disabled, invited_by, created_at)
+         SELECT ?, ?, 1, a.v, a.v, 0, ?, ?
+         FROM (SELECT CASE WHEN ? = 1 AND NOT EXISTS (SELECT 1 FROM users) THEN 1 ELSE 0 END AS v) a
+         WHERE (? IS NULL OR EXISTS (SELECT 1 FROM invites WHERE code = ? AND used_by IS NULL AND revoked = 0))`
+      ).bind(
+        ch.payload.uid,
+        ch.payload.name,
+        usedInvite,
+        nowIso,
+        firstUserAdmin ? 1 : 0,
+        usedInvite,
+        usedInvite
+      ),
+      insertPasskey(
+        c.env,
+        {
+          credentialId: credential.id,
+          uid: ch.payload.uid,
+          publicKey: credential.publicKey,
+          counter: credential.counter,
+          deviceType: credentialDeviceType,
+          backedUp: credentialBackedUp,
+          transports: credentialResp?.response?.transports,
+          label: null,
+          now: nowIso,
+        },
+        'EXISTS (SELECT 1 FROM users WHERE uid = ?)',
+        [ch.payload.uid]
+      ),
+      c.env.DB.prepare(
+        'UPDATE invites SET used_by = ?, used_at = ? WHERE code = ? AND used_by IS NULL AND revoked = 0 AND ? IS NOT NULL'
+      ).bind(ch.payload.uid, nowIso, usedInvite, usedInvite),
+    ]);
+  } catch (e) {
+    const dup = await c.env.DB.prepare('SELECT credential_id FROM passkeys WHERE credential_id = ?')
+      .bind(credential.id)
+      .first();
+    if (dup) return c.json(CREDENTIAL_EXISTS, 409);
+    throw e;
+  }
+  if (!results[0].meta.changes) {
+    return c.json({ error: 'invite code is no longer valid, ask for a new one', code: 'invite' }, 403);
+  }
 
   const user = (await getUserById(c.env, ch.payload.uid))!;
   await writeAudit(c.env, c.req.raw, 'auth.register.ok', { user, msg: usedInvite });
@@ -295,8 +384,11 @@ authRoutes.post('/api/login/verify', async (c) => {
   }
 
   const credentialResp = body.credential as AuthenticationResponseJSON;
+  if (!credentialResp?.id || typeof credentialResp.id !== 'string') {
+    return c.json({ error: 'unknown passkey, create a profile first', code: 'unknown-credential' }, 404);
+  }
   const cred = await c.env.DB.prepare('SELECT * FROM passkeys WHERE credential_id = ?')
-    .bind(credentialResp?.id || '')
+    .bind(credentialResp.id)
     .first<PasskeyRow>();
   if (!cred) {
     return c.json({ error: 'unknown passkey, create a profile first', code: 'unknown-credential' }, 404);
@@ -315,13 +407,13 @@ authRoutes.post('/api/login/verify', async (c) => {
         publicKey: base64UrlToBytes(cred.public_key),
         counter: cred.counter,
         transports: cred.transports_json
-          ? (JSON.parse(cred.transports_json) as AuthenticatorTransportFuture[])
+          ? (parseTransports(cred.transports_json) as AuthenticatorTransportFuture[])
           : undefined,
       },
     });
   } catch (e) {
     await writeAudit(c.env, c.req.raw, 'auth.login.fail', { ok: false, uid: cred.uid, msg: 'verify-error' });
-    return c.json({ error: (e as Error)?.message || 'verification failed' }, 400);
+    return c.json(verifyAnswer(c.env, c.req.raw, e), 400);
   }
 
   if (!verification.verified) {
@@ -361,7 +453,7 @@ authRoutes.post('/api/logout/all', async (c) => {
   if (!s) return c.json({ error: 'not signed in' }, 401);
   await c.env.DB.batch([
     c.env.DB.prepare('UPDATE users SET session_version = session_version + 1 WHERE uid = ?').bind(s.user.uid),
-    c.env.DB.prepare('DELETE FROM ephemeral_codes WHERE uid = ?').bind(s.user.uid),
+    c.env.DB.prepare("DELETE FROM ephemeral_codes WHERE uid = ? AND kind IN ('pair', 'device_link')").bind(s.user.uid),
     c.env.DB.prepare('DELETE FROM api_tokens WHERE uid = ?').bind(s.user.uid),
   ]);
   await writeAudit(c.env, c.req.raw, 'auth.logout.all', { user: s.user });
@@ -371,24 +463,25 @@ authRoutes.post('/api/logout/all', async (c) => {
 });
 
 authRoutes.post('/api/account/delete', async (c) => {
+  const limited = throttle(c, null);
+  if (limited) return limited;
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!(await stillSignedIn(c.env, c.req.raw, s.user.uid))) return c.json(SIGNED_OUT, 401);
   if (typeof body.name !== 'string' || body.name.trim() !== s.user.username) {
     return c.json({ error: 'type the account name to confirm', code: 'confirm-name' }, 400);
   }
-  const counts = await c.env.DB.prepare(
-    'SELECT COUNT(*) AS total, SUM(CASE WHEN is_admin = 1 THEN 1 ELSE 0 END) AS admins FROM users'
-  ).first<{ total: number; admins: number }>();
-  if (isAdmin(c.env, s.user) && (counts?.total ?? 0) > 1 && (counts?.admins ?? 0) <= 1) {
-    return c.json({ error: 'the last admin cannot leave while other profiles remain', code: 'last-admin' }, 409);
-  }
+  if (await lastAdminLeaving(c.env, s.user)) return c.json(LAST_ADMIN, 409);
 
   const paired = s.bearer && s.kind !== 'c';
   if (!paired) {
     const proof = await proveOwnerPasskey(c.env, c.req.raw, s.user, body);
     if (!proof.ok) return c.json(proof.body, proof.status);
   }
+  // Everything above awaited: the session may have ended, and another admin may have left.
+  if (!(await stillSignedIn(c.env, c.req.raw, s.user.uid))) return c.json(SIGNED_OUT, 401);
+  if (await lastAdminLeaving(c.env, s.user)) return c.json(LAST_ADMIN, 409);
 
   await c.env.DB.prepare('DELETE FROM users WHERE uid = ?').bind(s.user.uid).run();
   await writeAudit(c.env, c.req.raw, 'auth.account.delete', { user: s.user, msg: paired ? 'device' : 'passkey' });
@@ -401,33 +494,35 @@ authRoutes.post('/api/account/delete', async (c) => {
 
 authRoutes.get('/api/account/passkeys', async (c) => {
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const state = await passkeyStatePayload(c.env, s.user);
-  return c.json(state);
+  // The profile's own delete would be refused before any proof is looked at.
+  return c.json({ ...state, ...((await lastAdminLeaving(c.env, s.user)) ? { deleteBlocked: 'last-admin' } : {}) });
 });
 
 authRoutes.post('/api/account/passkeys/options', async (c) => {
+  const limited = throttle(c, null);
+  if (limited) return limited;
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const existing = await listUserPasskeys(c.env, s.user.uid);
-  if (existing.length >= MAX_PASSKEYS) {
-    return c.json({ error: `a profile can have at most ${MAX_PASSKEYS} passkeys`, code: 'passkey-limit' }, 409);
-  }
+  if (existing.length >= MAX_PASSKEYS) return c.json(PASSKEY_LIMIT, 409);
   const proof = await proveOwnerPasskey(c.env, c.req.raw, s.user, body);
   if (!proof.ok) return c.json(proof.body, proof.status);
+  if (!(await stillSignedIn(c.env, c.req.raw, s.user.uid))) return c.json(SIGNED_OUT, 401);
 
   const options = await generateRegistrationOptions({
     rpName: resolveRpName(c.env),
     rpID: resolveRpId(c.env, c.req.raw),
-    userID: new TextEncoder().encode(s.user.uid),
+    userID: new Uint8Array(new TextEncoder().encode(s.user.uid)),
     userName: s.user.username,
     userDisplayName: s.user.username,
     attestationType: 'none',
     authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
     excludeCredentials: existing.map((k) => ({
       id: k.credential_id,
-      transports: k.transports_json ? (JSON.parse(k.transports_json) as AuthenticatorTransportFuture[]) : [],
+      transports: parseTransports(k.transports_json) as AuthenticatorTransportFuture[],
     })),
   });
   const cid = randomBase64Url(16);
@@ -444,7 +539,7 @@ authRoutes.post('/api/account/passkeys/options', async (c) => {
 
 authRoutes.post('/api/account/passkeys/verify', async (c) => {
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const ch = await takeEphemeral<{ challenge: string; uid: string; sv: number }>(
     c.env,
@@ -465,41 +560,54 @@ authRoutes.post('/api/account/passkeys/verify', async (c) => {
       requireUserVerification: false,
     });
   } catch (e) {
-    return c.json({ error: (e as Error)?.message || 'verification failed' }, 400);
+    return c.json(verifyAnswer(c.env, c.req.raw, e), 400);
   }
   if (!verification.verified || !verification.registrationInfo) {
     return c.json({ error: 'not verified' }, 400);
   }
   const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
+  const dup = await c.env.DB.prepare('SELECT credential_id FROM passkeys WHERE credential_id = ?')
+    .bind(credential.id)
+    .first();
+  if (dup) return c.json(CREDENTIAL_EXISTS, 409);
   const nowIso = new Date().toISOString();
-  const label = textField(body.name).trim().slice(0, 40) || null;
-  await c.env.DB.prepare(
-    `INSERT INTO passkeys (credential_id, uid, public_key, counter, device_type, backed_up, transports_json, label, created_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      credential.id,
-      s.user.uid,
-      bytesToBase64Url(credential.publicKey),
-      credential.counter || 0,
-      credentialDeviceType || null,
-      credentialBackedUp ? 1 : 0,
-      JSON.stringify(credentialResp?.response?.transports || []),
-      label,
-      nowIso,
-      nowIso
-    )
-    .run();
+  // The cap is checked in the INSERT itself, so two adds racing under it cannot both land.
+  let added;
+  try {
+    added = await insertPasskey(
+      c.env,
+      {
+        credentialId: credential.id,
+        uid: s.user.uid,
+        publicKey: credential.publicKey,
+        counter: credential.counter,
+        deviceType: credentialDeviceType,
+        backedUp: credentialBackedUp,
+        transports: credentialResp?.response?.transports,
+        label: passkeyName(body.name) || null,
+        now: nowIso,
+      },
+      '(SELECT COUNT(*) FROM passkeys WHERE uid = ?) < ?',
+      [s.user.uid, MAX_PASSKEYS]
+    ).run();
+  } catch (e) {
+    const again = await c.env.DB.prepare('SELECT credential_id FROM passkeys WHERE credential_id = ?')
+      .bind(credential.id)
+      .first();
+    if (again) return c.json(CREDENTIAL_EXISTS, 409);
+    throw e;
+  }
+  if (!added.meta.changes) return c.json(PASSKEY_LIMIT, 409);
   await writeAudit(c.env, c.req.raw, 'auth.passkey.add', { user: s.user });
   return c.json({ ok: true, ...(await passkeyStatePayload(c.env, s.user)) });
 });
 
 authRoutes.post('/api/account/passkeys/rename', async (c) => {
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const id = textField(body.id);
-  const label = textField(body.name).trim().slice(0, 40) || null;
+  const label = passkeyName(body.name) || null;
   const res = await c.env.DB.prepare('UPDATE passkeys SET label = ? WHERE credential_id = ? AND uid = ?')
     .bind(label, id, s.user.uid)
     .run();
@@ -508,8 +616,10 @@ authRoutes.post('/api/account/passkeys/rename', async (c) => {
 });
 
 authRoutes.delete('/api/account/passkeys', async (c) => {
+  const limited = throttle(c, null);
+  if (limited) return limited;
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const id = c.req.query('id') || '';
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const existing = await listUserPasskeys(c.env, s.user.uid);
@@ -517,66 +627,88 @@ authRoutes.delete('/api/account/passkeys', async (c) => {
     return c.json({ error: 'passkey not found', code: 'not-found' }, 404);
   }
   if (existing.length <= 1) {
-    return c.json({ error: 'cannot remove your last passkey', code: 'last-way-in' }, 409);
+    return c.json({ error: 'this passkey is the only way into this profile', code: 'last-way-in' }, 409);
   }
   const proof = await proveOwnerPasskey(c.env, c.req.raw, s.user, body);
   if (!proof.ok) return c.json(proof.body, proof.status);
+  if (!(await stillSignedIn(c.env, c.req.raw, s.user.uid))) return c.json(SIGNED_OUT, 401);
 
-  await c.env.DB.batch([
-    c.env.DB.prepare('DELETE FROM passkeys WHERE credential_id = ? AND uid = ?').bind(id, s.user.uid),
-    c.env.DB.prepare("DELETE FROM ephemeral_codes WHERE kind = 'device_link' AND uid = ?").bind(s.user.uid),
-  ]);
+  // Never the last one: the delete lands only while another passkey is left.
+  const removed = await c.env.DB.prepare(
+    'DELETE FROM passkeys WHERE credential_id = ? AND uid = ? AND (SELECT COUNT(*) FROM passkeys WHERE uid = ?) > 1'
+  )
+    .bind(id, s.user.uid, s.user.uid)
+    .run();
+  if (!removed.meta.changes) {
+    return c.json({ error: 'this passkey is the only way into this profile', code: 'last-way-in' }, 409);
+  }
+  await c.env.DB.prepare("DELETE FROM ephemeral_codes WHERE kind = 'device_link' AND uid = ?").bind(s.user.uid).run();
   await writeAudit(c.env, c.req.raw, 'auth.passkey.remove', { user: s.user });
   return c.json({ ok: true, ...(await passkeyStatePayload(c.env, s.user)) });
 });
 
 /* ---------- Device Link & Recovery ---------- */
 
+const LINK_INVALID = { error: 'that code is wrong, used or expired', code: 'link-invalid' };
+
+async function linkHash(code: unknown): Promise<string> {
+  return sha256Hex('opengym-link:' + textField(code).replace(/[^A-Za-z0-9]/g, '').toUpperCase());
+}
+
 authRoutes.post('/api/account/device-link', async (c) => {
+  const limited = throttle(c, null);
+  if (limited) return limited;
   const s = await getSessionFromRequest(c.env, c.req.raw);
-  if (!s) return c.json({ error: 'not signed in' }, 401);
+  if (!s) return c.json(SIGNED_OUT, 401);
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
   const existing = await listUserPasskeys(c.env, s.user.uid);
-  if (existing.length >= MAX_PASSKEYS) {
-    return c.json({ error: `a profile can have at most ${MAX_PASSKEYS} passkeys`, code: 'passkey-limit' }, 409);
-  }
+  if (existing.length >= MAX_PASSKEYS) return c.json(PASSKEY_LIMIT, 409);
   const proof = await proveOwnerPasskey(c.env, c.req.raw, s.user, body);
   if (!proof.ok) return c.json(proof.body, proof.status);
+  if (!(await stillSignedIn(c.env, c.req.raw, s.user.uid))) return c.json(SIGNED_OUT, 401);
 
   const rawCode = `${randomCode(4)}-${randomCode(4)}-${randomCode(4)}`;
-  const hash = await sha256Hex('opengym-link:' + rawCode.replace(/-/g, '').toUpperCase());
+  const hash = await linkHash(rawCode);
   const expires = Date.now() + DEVICE_LINK_TTL_MS;
+  // One live code per profile: a new one retires the last.
+  await c.env.DB.prepare("DELETE FROM ephemeral_codes WHERE kind = 'device_link' AND uid = ?").bind(s.user.uid).run();
   await putEphemeral(c.env, `dl:${hash}`, 'device_link', { uid: s.user.uid, kind: 'link' }, DEVICE_LINK_TTL_MS, s.user.uid);
   await writeAudit(c.env, c.req.raw, 'auth.link.create', { user: s.user, msg: 'passkey' });
   return c.json({ code: rawCode, expires });
 });
 
 authRoutes.post('/api/device-link/options', async (c) => {
+  const limited = throttle(c, 'link');
+  if (limited) return limited;
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const norm = textField(body.code).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-  const hash = await sha256Hex('opengym-link:' + norm);
+  const paused = addressPaused(c, 'link');
+  if (paused) return paused;
+  const hash = await linkHash(body.code);
   const link = await peekEphemeral<{ uid: string; kind: string }>(c.env, `dl:${hash}`, 'device_link');
-  if (!link) return c.json({ error: 'that code is wrong, used or expired', code: 'link-invalid' }, 400);
+  if (!link) {
+    strikeAddress(c, 'link');
+    return c.json(LINK_INVALID, 400);
+  }
 
   const user = await getUserById(c.env, link.payload.uid);
   if (!user || user.disabled === 1) {
-    return c.json({ error: 'that code is wrong, used or expired', code: 'link-invalid' }, 400);
+    return c.json(LINK_INVALID, 400);
   }
   const existing = await listUserPasskeys(c.env, user.uid);
   if (link.payload.kind !== 'recovery' && existing.length >= MAX_PASSKEYS) {
-    return c.json({ error: `a profile can have at most ${MAX_PASSKEYS} passkeys`, code: 'passkey-limit' }, 409);
+    return c.json(PASSKEY_LIMIT, 409);
   }
   const options = await generateRegistrationOptions({
     rpName: resolveRpName(c.env),
     rpID: resolveRpId(c.env, c.req.raw),
-    userID: new TextEncoder().encode(user.uid),
+    userID: new Uint8Array(new TextEncoder().encode(user.uid)),
     userName: user.username,
     userDisplayName: user.username,
     attestationType: 'none',
     authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
     excludeCredentials: existing.map((k) => ({
       id: k.credential_id,
-      transports: k.transports_json ? (JSON.parse(k.transports_json) as AuthenticatorTransportFuture[]) : [],
+      transports: parseTransports(k.transports_json) as AuthenticatorTransportFuture[],
     })),
   });
   const cid = randomBase64Url(16);
@@ -598,22 +730,30 @@ authRoutes.post('/api/device-link/options', async (c) => {
 });
 
 authRoutes.post('/api/device-link/verify', async (c) => {
+  const limited = throttle(c, 'link');
+  if (limited) return limited;
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
-  const norm = textField(body.code).replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-  const hash = await sha256Hex('opengym-link:' + norm);
+  const paused = addressPaused(c, 'link');
+  if (paused) return paused;
+  const hash = await linkHash(body.code);
   const ch = await takeEphemeral<{ challenge: string; uid: string; lh: string }>(
     c.env,
     `ch:${textField(body.cid)}`,
     'challenge_link'
   );
-  const link = await takeEphemeral<{ uid: string; kind: string }>(c.env, `dl:${hash}`, 'device_link');
-  if (!link) return c.json({ error: 'that code is wrong, used or expired', code: 'link-invalid' }, 400);
+  // Only looked at here: the code is used up once the passkey is saved, so a prompt dismissed by
+  // mistake can be tried again.
+  const link = await peekEphemeral<{ uid: string; kind: string }>(c.env, `dl:${hash}`, 'device_link');
+  if (!link) {
+    strikeAddress(c, 'link');
+    return c.json(LINK_INVALID, 400);
+  }
   if (!ch || ch.payload.lh !== hash || ch.payload.uid !== link.payload.uid) {
     return c.json({ error: 'challenge expired, try again', code: 'challenge-expired' }, 400);
   }
   const user = await getUserById(c.env, link.payload.uid);
   if (!user || user.disabled === 1) {
-    return c.json({ error: 'that code is wrong, used or expired', code: 'link-invalid' }, 400);
+    return c.json(LINK_INVALID, 400);
   }
 
   const credentialResp = body.credential as RegistrationResponseJSON;
@@ -627,32 +767,70 @@ authRoutes.post('/api/device-link/verify', async (c) => {
       requireUserVerification: false,
     });
   } catch (e) {
-    return c.json({ error: (e as Error)?.message || 'verification failed' }, 400);
+    await writeAudit(c.env, c.req.raw, 'auth.link.fail', { ok: false, user, msg: 'verify-error' });
+    return c.json(verifyAnswer(c.env, c.req.raw, e), 400);
   }
   if (!verification.verified || !verification.registrationInfo) {
     return c.json({ error: 'not verified' }, 400);
   }
   const { credential, credentialDeviceType, credentialBackedUp } = verification.registrationInfo;
-  const nowIso = new Date().toISOString();
-  await c.env.DB.prepare(
-    `INSERT INTO passkeys (credential_id, uid, public_key, counter, device_type, backed_up, transports_json, label, created_at, last_used_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  )
-    .bind(
-      credential.id,
-      user.uid,
-      bytesToBase64Url(credential.publicKey),
-      credential.counter || 0,
-      credentialDeviceType || null,
-      credentialBackedUp ? 1 : 0,
-      JSON.stringify(credentialResp?.response?.transports || []),
-      textField(body.name).trim().slice(0, 40) || null,
-      nowIso,
-      nowIso
-    )
-    .run();
+  const dup = await c.env.DB.prepare('SELECT credential_id FROM passkeys WHERE credential_id = ?')
+    .bind(credential.id)
+    .first();
+  if (dup) return c.json(CREDENTIAL_EXISTS, 409);
 
-  await writeAudit(c.env, c.req.raw, link.payload.kind === 'recovery' ? 'auth.recovery.ok' : 'auth.link.ok', { user });
+  const recovery = link.payload.kind === 'recovery';
+  const existing = await listUserPasskeys(c.env, user.uid);
+  if (!recovery && existing.length >= MAX_PASSKEYS) return c.json(PASSKEY_LIMIT, 409);
+
+  const nowIso = new Date().toISOString();
+  const linkAlive = 'EXISTS (SELECT 1 FROM ephemeral_codes WHERE code = ? AND expires_at > ?)';
+  const linkBinds = [`dl:${hash}`, Date.now()];
+  // Recovery on a full profile: the passkey used longest ago goes, to make room for this one.
+  // Every statement lands only while the code is still live, and the code is burnt last, so two
+  // redemptions cannot both succeed.
+  let results;
+  try {
+    results = await c.env.DB.batch([
+      c.env.DB.prepare(
+        `DELETE FROM passkeys WHERE ? = 1 AND uid = ? AND (SELECT COUNT(*) FROM passkeys WHERE uid = ?) >= ?
+           AND credential_id = (SELECT credential_id FROM passkeys WHERE uid = ? ORDER BY COALESCE(last_used_at, created_at) ASC LIMIT 1)
+           AND ${linkAlive}`
+      ).bind(recovery ? 1 : 0, user.uid, user.uid, MAX_PASSKEYS, user.uid, ...linkBinds),
+      insertPasskey(
+        c.env,
+        {
+          credentialId: credential.id,
+          uid: user.uid,
+          publicKey: credential.publicKey,
+          counter: credential.counter,
+          deviceType: credentialDeviceType,
+          backedUp: credentialBackedUp,
+          transports: credentialResp?.response?.transports,
+          label: passkeyName(body.name) || null,
+          now: nowIso,
+        },
+        linkAlive,
+        linkBinds
+      ),
+      c.env.DB.prepare('DELETE FROM ephemeral_codes WHERE code = ?').bind(`dl:${hash}`),
+    ]);
+  } catch (e) {
+    const again = await c.env.DB.prepare('SELECT credential_id FROM passkeys WHERE credential_id = ?')
+      .bind(credential.id)
+      .first();
+    if (again) return c.json(CREDENTIAL_EXISTS, 409);
+    throw e;
+  }
+  if (!results[1].meta.changes) {
+    await writeAudit(c.env, c.req.raw, 'auth.link.fail', { ok: false, user, msg: 'link-invalid' });
+    return c.json(LINK_INVALID, 400);
+  }
+
+  await writeAudit(c.env, c.req.raw, recovery ? 'auth.recovery.ok' : 'auth.link.ok', {
+    user,
+    msg: [passkeyName(body.name), results[0].meta.changes ? 'replaced a passkey' : ''].filter(Boolean).join(', ') || null,
+  });
   const cookies = await makeSessionCookieHeaders(c.env, c.req.raw, user);
   const res = c.json({ user: publicUser(c.env, user) });
   setCookies(res.headers, cookies);

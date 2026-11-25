@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { Env, flagOn } from '../env';
+import { Env, adminUidSet, flagOn } from '../env';
 import { randomCode, randomHex, sha256Hex } from '../crypto';
 import {
   UserRow,
@@ -12,6 +12,7 @@ import {
   writeAudit,
 } from '../db';
 import { readUserState, sanitizeRecords } from './data';
+import { auditRetention, pruneAudit } from '../lib/audit-retention';
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 
@@ -25,6 +26,18 @@ async function requireAdmin(env: Env, req: Request): Promise<UserRow | Response>
     return Response.json({ error: 'forbidden' }, { status: 403 });
   }
   return s.user;
+}
+
+/** Admins on the instance: the flagged users plus the ADMIN_UIDS that exist (upstream filters db.users by isAdmin). */
+async function adminCount(env: Env): Promise<number> {
+  const ids = [...adminUidSet(env)];
+  const marks = ids.map(() => '?').join(',');
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS cnt FROM users WHERE is_admin = 1${ids.length ? ` OR uid IN (${marks})` : ''}`
+  )
+    .bind(...ids)
+    .first<{ cnt: number }>();
+  return row?.cnt ?? 0;
 }
 
 async function requireOwner(env: Env, req: Request): Promise<UserRow | Response> {
@@ -42,18 +55,32 @@ adminRoutes.get('/api/admin/users', async (c) => {
   if (admin instanceof Response) return admin;
 
   const view = flagOn(c.env.ADMIN_DATA_VIEW, false);
+  // The workout count, last workout and _ts are read by SQLite (JSON1) so the Worker never parses
+  // any user's state blob: that was the one request that would blow the 10 ms CPU budget.
   const res = await c.env.DB.prepare(
-    `SELECT u.*, s.state_json, s.updated_at AS state_updated_at
+    `SELECT u.*, s.updated_at AS state_updated_at,
+       json_extract(s.state_json, '$._ts') AS state_ts,
+       CASE WHEN json_type(s.state_json, '$.workouts') = 'array' THEN
+         (SELECT COUNT(*) FROM json_each(s.state_json, '$.workouts') j WHERE j.type = 'object')
+       ELSE 0 END AS workouts_count,
+       CASE WHEN json_type(s.state_json, '$.workouts') = 'array' THEN
+         (SELECT json_extract(j.value, '$.d') FROM json_each(s.state_json, '$.workouts') j
+           WHERE j.type = 'object' ORDER BY j.id DESC LIMIT 1)
+       ELSE NULL END AS last_workout
      FROM users u
      LEFT JOIN user_states s ON s.uid = u.uid
      ORDER BY u.created_at ASC`
-  ).all<UserRow & { state_json: string | null; state_updated_at: number | null }>();
+  ).all<
+    UserRow & {
+      state_updated_at: number | null;
+      state_ts: unknown;
+      workouts_count: number | null;
+      last_workout: unknown;
+    }
+  >();
 
   const users = (res.results || []).map((u) => {
-    const st = u.state_json ? (JSON.parse(u.state_json) as Record<string, unknown>) : {};
-    const workouts = sanitizeRecords(st.workouts);
-    const last = workouts[workouts.length - 1];
-    const lastSync = Math.max(Number(st._ts) || 0, u.last_pull || 0, u.state_updated_at || 0) || null;
+    const lastSync = Math.max(Number(u.state_ts) || 0, u.last_pull || 0, u.state_updated_at || 0) || null;
     return {
       id: u.uid,
       name: u.username,
@@ -62,14 +89,15 @@ adminRoutes.get('/api/admin/users', async (c) => {
       admin: isAdmin(c.env, u),
       owner: isOwner(c.env, u),
       invitedBy: u.invited_by,
-      workouts: workouts.length,
-      ...(view ? { lastWorkout: (last?.d as string) || null } : {}),
+      workouts: u.workouts_count || 0,
+      ...(view ? { lastWorkout: u.last_workout ?? null } : {}),
       lastSync,
       hasPush: false,
       live: null,
     };
   });
 
+  if (view) await writeAudit(c.env, c.req.raw, 'admin.data-view', { user: admin, msg: 'user list' });
   return c.json({
     users,
     invite_only: flagOn(c.env.INVITE_ONLY, false),
@@ -91,6 +119,21 @@ adminRoutes.get('/api/admin/user', async (c) => {
   const bytes = cur.state ? JSON.stringify(cur.state).length : 0;
   const view = flagOn(c.env.ADMIN_DATA_VIEW, false);
 
+  // Until when an unused recovery code is good (the live device link made by an admin).
+  const links = await c.env.DB.prepare(
+    "SELECT payload_json, expires_at FROM ephemeral_codes WHERE kind = 'device_link' AND uid = ? AND expires_at > ?"
+  )
+    .bind(u.uid, Date.now())
+    .all<{ payload_json: string; expires_at: number }>();
+  let recoveryUntil: number | null = null;
+  for (const l of links.results || []) {
+    try {
+      if ((JSON.parse(l.payload_json) as { kind?: string }).kind === 'recovery') recoveryUntil = l.expires_at;
+    } catch {
+      /* not ours */
+    }
+  }
+
   const base = {
     user: {
       id: u.uid,
@@ -100,7 +143,7 @@ adminRoutes.get('/api/admin/user', async (c) => {
       admin: isAdmin(c.env, u),
       owner: isOwner(c.env, u),
       invitedBy: u.invited_by,
-      recoveryUntil: null,
+      recoveryUntil,
     },
     unit: (st.unit as string) || 'kg',
     lastSync: Math.max(Number(st._ts) || 0, u.last_pull || 0) || null,
@@ -117,6 +160,8 @@ adminRoutes.get('/api/admin/user', async (c) => {
 
   if (!view) return c.json(base);
 
+  await writeAudit(c.env, c.req.raw, 'admin.data-view', { user: admin, target: u });
+
   return c.json({
     ...base,
     routines: sanitizeRecords(st.routines).map((r) => ({
@@ -126,7 +171,10 @@ adminRoutes.get('/api/admin/user', async (c) => {
       count: sanitizeRecords(r.ex).length,
     })),
     bodyweight: sanitizeRecords(st.bodyweight),
-    workouts: sanitizeRecords(st.workouts).reverse(),
+    // A workout's photos and videos are the owner's own: the admin view gets no refs to them.
+    workouts: sanitizeRecords(st.workouts)
+      .reverse()
+      .map(({ media: _media, ...w }) => w),
   });
 });
 
@@ -140,6 +188,10 @@ adminRoutes.post('/api/admin/user/disable', async (c) => {
 
   const disabled = body.disabled ? 1 : 0;
   await c.env.DB.prepare('UPDATE users SET disabled = ? WHERE uid = ?').bind(disabled, u.uid).run();
+  // A device link made before the lock would otherwise still be waiting when it is lifted.
+  if (disabled) {
+    await c.env.DB.prepare("DELETE FROM ephemeral_codes WHERE kind = 'device_link' AND uid = ?").bind(u.uid).run();
+  }
   await writeAudit(c.env, c.req.raw, disabled ? 'admin.user.disable' : 'admin.user.enable', {
     user: admin,
     target: u,
@@ -154,8 +206,14 @@ adminRoutes.post('/api/admin/user/delete', async (c) => {
   const u = await getUserById(c.env, textField(body.id));
   if (!u) return c.json({ error: 'no such user' }, 404);
   if (u.uid === admin.uid) return c.json({ error: 'you cannot delete your own account' }, 400);
-  if (isOwner(c.env, u)) return c.json({ error: 'the owner cannot be deleted; hand the role first' }, 400);
+  if (isAdmin(c.env, u) && (await adminCount(c.env)) <= 1) {
+    return c.json({ error: 'cannot delete the last admin' }, 400);
+  }
+  if (isOwner(c.env, u)) {
+    return c.json({ error: 'the owner cannot be deleted; hand the role to another admin first' }, 400);
+  }
   if (isAdmin(c.env, u) && !isOwner(c.env, admin)) {
+    await writeAudit(c.env, c.req.raw, 'admin.denied', { ok: false, user: admin, target: u });
     return c.json({ error: 'only the owner can delete an admin' }, 403);
   }
   await c.env.DB.prepare('DELETE FROM users WHERE uid = ?').bind(u.uid).run();
@@ -171,6 +229,9 @@ adminRoutes.post('/api/admin/user/role', async (c) => {
   if (!u) return c.json({ error: 'no such user' }, 404);
   if (u.uid === owner.uid) return c.json({ error: 'the owner stays an admin' }, 400);
   if (typeof body.admin !== 'boolean') return c.json({ error: 'admin must be true or false' }, 400);
+  if (adminUidSet(c.env).has(u.uid)) {
+    return c.json({ error: 'this admin is set in ADMIN_UIDS on the server' }, 400);
+  }
   if (body.admin && u.disabled === 1) return c.json({ error: 'enable the account first' }, 400);
 
   await c.env.DB.prepare('UPDATE users SET is_admin = ?, is_owner = 0 WHERE uid = ?')
@@ -299,20 +360,24 @@ adminRoutes.get('/api/admin/audit', async (c) => {
   const admin = await requireAdmin(c.env, c.req.raw);
   if (admin instanceof Response) return admin;
 
+  // Nothing past its retention is ever served (upstream prunes on read as well).
+  await pruneAudit(c.env);
+
   const limit = Math.max(1, Math.min(200, Number(c.req.query('limit')) || 100));
   const before = Number(c.req.query('before')) || Number.MAX_SAFE_INTEGER;
   const cat = c.req.query('cat') || '';
 
-  let sql = 'SELECT * FROM audit_log WHERE id < ?';
-  const binds: unknown[] = [before];
+  // The count and the rows share one filter; `before` only pages the rows.
+  let where = '1 = 1';
+  const fbinds: unknown[] = [];
   if (cat === 'fail') {
-    sql += ' AND ok = 0';
+    where += ' AND ok = 0';
   } else if (cat) {
-    sql += ' AND action LIKE ?';
-    binds.push(`${cat}.%`);
+    where += " AND action LIKE ? ESCAPE '\\'";
+    fbinds.push(`${cat.replace(/[\\%_]/g, '\\$&')}.%`);
   }
-  sql += ' ORDER BY id DESC LIMIT ?';
-  binds.push(limit);
+  const sql = `SELECT * FROM audit_log WHERE ${where} AND id < ? ORDER BY id DESC LIMIT ?`;
+  const binds: unknown[] = [...fbinds, before, limit];
 
   const res = await c.env.DB.prepare(sql).bind(...binds).all<{
     id: number;
@@ -327,7 +392,9 @@ adminRoutes.get('/api/admin/audit', async (c) => {
     ip: string | null;
   }>();
 
-  const totalRow = await c.env.DB.prepare('SELECT COUNT(*) AS cnt FROM audit_log').first<{ cnt: number }>();
+  const totalRow = await c.env.DB.prepare(`SELECT COUNT(*) AS cnt FROM audit_log WHERE ${where}`)
+    .bind(...fbinds)
+    .first<{ cnt: number }>();
   const events = (res.results || []).map((r) => ({
     id: r.id,
     ts: r.ts,
@@ -343,11 +410,11 @@ adminRoutes.get('/api/admin/audit', async (c) => {
 
   return c.json({
     events,
-    total: totalRow?.cnt ?? events.length,
+    total: totalRow?.cnt ?? 0,
     nextBefore: events.length === limit ? events[events.length - 1].id : null,
     enabled: flagOn(c.env.AUDIT_LOG, true),
     ip_mode: (c.env.AUDIT_IP || 'off').toLowerCase(),
-    retention: { max: 5000, days: 90 },
+    retention: auditRetention(c.env),
     now: Date.now(),
   });
 });

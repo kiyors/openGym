@@ -166,7 +166,7 @@ export async function createScopedToken(
 
 export async function authenticateApiToken(
   env: Env,
-  ctx: ExecutionContext,
+  ctx: { waitUntil(promise: Promise<unknown>): void },
   rawToken: string
 ): Promise<AuthenticatedApiToken | null> {
   if (!rawToken || !rawToken.startsWith(TOKEN_PREFIX) || rawToken.length !== TOKEN_PREFIX.length + 43) {
@@ -347,13 +347,32 @@ tokenRoutes.put('/api/token/data', async (c) => {
   }
 
   const next = merged.next;
+  const validList = (v: unknown) => v == null || Array.isArray(v);
+  if (!validList(next.workouts) || !validList(next.routines)) return c.json({ error: 'invalid state' }, 400);
   if (Array.isArray(next.workouts)) next.workouts = sanitizeRecords(next.workouts);
   if (Array.isArray(next.routines)) next.routines = sanitizeRecords(next.routines);
 
+  // Stamped like any writer that does not stamp its own changes, over the revision it read
+  // (api/server.js PUT /api/token/data: overRead true, stamped false).
   const done = await commitUserState(c.env, c.executionCtx, auth.user.uid, cur, next, {
     baseRev: body.baseRev as number,
     baseWid: typeof body.baseWid === 'string' ? body.baseWid : null,
+    stamped: false,
   });
+  // Another device wrote between the read above and this write: the 409 carries the current
+  // document as this token may see it, never the whole profile.
+  if (done.status === 409) {
+    const fresh = await readUserState(c.env, auth.user.uid);
+    return c.json(
+      {
+        error: 'conflict',
+        rev: fresh.rev,
+        state: fresh.state ? scopedState(fresh.state, auth.scopes) : null,
+        ...(fresh.wid ? { wid: fresh.wid } : {}),
+      },
+      409
+    );
+  }
   if (done.status === 200) {
     await writeAudit(c.env, c.req.raw, 'token.write', {
       user: auth.user,

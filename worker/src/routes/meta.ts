@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { Env, flagOn, resolveSessionDays, webhookEnabled } from '../env';
 import { getSessionFromRequest, makeBearerSessionToken, publicUser } from '../db';
+// Upstream's nudge rule, imported as-is (pure ESM): the same answer a Docker server gives.
+import { excusedOn, nudgeFor } from '../../../api/nudge.js';
 
 export const metaRoutes = new Hono<{ Bindings: Env }>();
 
@@ -23,32 +25,10 @@ metaRoutes.get('/api/config', async (c) => {
   const mcpOn = flagOn(c.env.MCP, true);
   const defaultLang = (c.env.DEFAULT_LANG || '').trim();
 
-  let coachPublic: Record<string, unknown> | null = null;
-  if (signedIn) {
-    try {
-      const cfg = await c.env.DB.prepare(
-        'SELECT enabled, active_provider, config_json, providers_enc_json FROM coach_settings WHERE id = 1'
-      ).first<{
-        enabled: number;
-        active_provider: string;
-        config_json: string;
-        providers_enc_json: string;
-      }>();
-      if (cfg && cfg.enabled === 1) {
-        const enc = JSON.parse(cfg.providers_enc_json || '{}') as Record<string, unknown>;
-        if (enc[cfg.active_provider]) {
-          const parsedCfg = JSON.parse(cfg.config_json || '{}') as Record<string, unknown>;
-          coachPublic = {
-            enabled: true,
-            provider: cfg.active_provider,
-            model: (parsedCfg.models as Record<string, string> | undefined)?.[cfg.active_provider] || null,
-          };
-        }
-      }
-    } catch {
-      coachPublic = null;
-    }
-  }
+  // The Coach's job runner needs a filesystem, timers and long-lived processes, so it is not
+  // offered here: a session gets `coach: null`, what upstream's publicConfig() answers with the
+  // Coach off, and the app hides it (frontend lib/coach.js coachAvailable).
+  const coachPublic = null;
 
   return c.json({
     invite_only: inviteOnly,
@@ -58,7 +38,7 @@ metaRoutes.get('/api/config', async (c) => {
     ...(defaultLang ? { default_lang: defaultLang } : {}),
     ...(signedIn ? { coach: coachPublic } : {}),
     ...(signedIn && webhookEnabled(c.env)
-      ? { integrations: { providers: [{ id: 'webhook', label: 'Webhook' }] } }
+      ? { integrations: { providers: ['webhook'] } }
       : {}),
   });
 });
@@ -87,8 +67,14 @@ metaRoutes.get('/api/nudge-check', async (c) => {
     .first<{ rev: number; state_json: string }>();
   const doc = row ? (JSON.parse(row.state_json) as Record<string, unknown>) : {};
   const workouts = Array.isArray(doc.workouts) ? (doc.workouts as Array<{ d?: string }>) : [];
-  const done = workouts.some((w) => w && w.d === date);
-  return c.json({ date, done, nudge: !done, rev: row?.rev ?? 0 });
+  const done = workouts.some((w) => w && w.d === date) || !!excusedOn(doc, date);
+  let nudge = false;
+  try {
+    nudge = !done && !!nudgeFor(doc, date);
+  } catch {
+    nudge = true; // unreadable: keep what the phone planned
+  }
+  return c.json({ date, done, nudge, rev: row?.rev ?? 0 });
 });
 
 metaRoutes.post('/api/activity', async (c) => {
@@ -96,3 +82,10 @@ metaRoutes.post('/api/activity', async (c) => {
   if (!s) return c.json({ error: 'not signed in' }, 401);
   return c.json({ ok: true });
 });
+
+// Web Push (rest-timer and reminder notifications in the browser) is not offered on this
+// deployment yet; the phone apps notify on their own. Settings → Notifications asks for the key
+// first, so that is where the answer has to be human rather than "not found".
+metaRoutes.get('/api/push/public-key', (c) =>
+  c.json({ error: 'Push notifications are not available on this server' }, 503)
+);

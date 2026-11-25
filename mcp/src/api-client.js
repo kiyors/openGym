@@ -65,9 +65,10 @@ export function apiConfig(env = process.env) {
 
 /**
  * One request. Resolves { status, body } for 2xx and 409 (a conflict is the caller's to merge);
- * throws EAUTH, ETOOBIG, EAPI otherwise. `fetchImpl` is for tests.
+ * throws EAUTH, ETOOBIG, EAPI otherwise. `fetchImpl` is for tests, or set on `cfg` by a host that
+ * answers the api in-process (the Cloudflare Worker, worker/src/mcp-bridge.ts).
  */
-export async function apiFetch(cfg, path, { method = 'GET', body, timeoutMs = TIMEOUT_MS, fetchImpl = fetch } = {}) {
+export async function apiFetch(cfg, path, { method = 'GET', body, timeoutMs = TIMEOUT_MS, fetchImpl = cfg.fetchImpl || fetch } = {}) {
   let res
   try {
     res = await fetchImpl(cfg.base + path, {

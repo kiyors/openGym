@@ -11,14 +11,16 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "db:migrate:local": "wrangler d1 migrations apply opengym-db --local -c ../wrangler.jsonc",
-    "db:migrate:remote": "wrangler d1 migrations apply opengym-db --remote -c ../wrangler.jsonc"
+    "db:migrate:remote": "wrangler d1 migrations apply opengym-db --remote -c ../wrangler.jsonc",
+    "invite": "node scripts/invite.mjs",
+    "e2e": "node test/e2e.mjs"
   },
   "dependencies": {
     "@simplewebauthn/server": "^13.3.3",
     "hono": "^4.7.10"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250408.0",
+    "@cloudflare/workers-types": "^5.20261123.1",
     "typescript": "^5.8.3",
     "vitest": "^3.1.2",
     "wrangler": "^4.14.0"

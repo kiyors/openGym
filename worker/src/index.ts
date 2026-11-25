@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { Env, flagOn } from './env';
+import { Env, flagOn, webhookEnabled } from './env';
 import { APP_ORIGINS, checkCsrf, corsHeaders } from './db';
 import { metaRoutes } from './routes/meta';
 import { authRoutes } from './routes/auth';
@@ -7,10 +7,11 @@ import { pairRoutes } from './routes/pair';
 import { dataRoutes } from './routes/data';
 import { tokenRoutes } from './routes/tokens';
 import { oauthRoutes } from './routes/oauth';
-import { mcpRoutes } from './routes/mcp';
+import { mcpRoutes, registerAppFetch } from './routes/mcp';
 import { adminRoutes } from './routes/admin';
 import { coachRoutes } from './routes/coach';
-import { webhookRoutes } from './routes/webhooks';
+import { runDueWebhooks, webhookRoutes } from './routes/webhooks';
+import { calendarRoutes } from './routes/calendar';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -68,6 +69,7 @@ app.route('/', mcpRoutes);
 app.route('/', adminRoutes);
 app.route('/', coachRoutes);
 app.route('/', webhookRoutes);
+app.route('/', calendarRoutes);
 
 // 4. Explicit 404 for unknown /api/* routes
 app.all('/api/*', (c) => c.json({ error: 'not found' }, 404));
@@ -85,4 +87,14 @@ app.onError((err, c) => {
   return c.json({ error: 'server error' }, 500);
 });
 
-export default app;
+// The MCP tools reach the API through the Worker's own router, in-process (routes/mcp.ts).
+registerAppFetch((req, env, ctx) => app.fetch(req, env, ctx));
+
+export default {
+  fetch: app.fetch,
+  // Webhook retries come due on their own clock; a state write sends what is due too, but a
+  // profile that stops writing still gets its retries out (wrangler.jsonc triggers.crons).
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (webhookEnabled(env)) ctx.waitUntil(runDueWebhooks(env));
+  },
+};

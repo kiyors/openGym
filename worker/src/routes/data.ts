@@ -3,6 +3,9 @@ import { Env } from '../env';
 import { randomHex } from '../crypto';
 import { getSessionFromRequest } from '../db';
 import { dispatchWebhooks } from './webhooks';
+// Upstream's own sync rules, imported rather than copied (plain ESM with no imports of its own),
+// so the worker stamps and merges exactly like api/server.js commitState.
+import { stampPut } from '../../../api/sync-stamps.js';
 
 export const dataRoutes = new Hono<{ Bindings: Env }>();
 
@@ -41,14 +44,15 @@ export async function readUserState(
  */
 export async function commitUserState(
   env: Env,
-  ctx: ExecutionContext,
+  ctx: { waitUntil(promise: Promise<unknown>): void },
   uid: string,
   cur: { rev: number; wid: string | null; state: Record<string, unknown> | null },
   nextState: Record<string, unknown>,
-  opts: { baseRev?: number | null; baseWid?: string | null } = {}
+  opts: { baseRev?: number | null; baseWid?: string | null; stamped?: boolean } = {}
 ): Promise<
   | { status: 200; body: { ok: true; ts: number | null; rev: number; wid: string } }
   | { status: 409; body: { error: 'conflict'; rev: number; state: Record<string, unknown> | null; wid?: string } }
+  | { status: 400; body: { error: string } }
 > {
   const curRev = cur.rev || 0;
   if (
@@ -66,7 +70,7 @@ export async function commitUserState(
     };
   }
 
-  const state = { ...nextState };
+  const state: Record<string, unknown> = { ...nextState };
   delete state.active;
 
   // Preserve monotonic resetAt
@@ -80,19 +84,42 @@ export async function commitUserState(
     }
   }
 
+  // The records of removals and edits only grow, and what a writer that does not stamp its own
+  // changes (an older app, an API script, an MCP write) changed is stamped here (api/sync-stamps.js).
+  const report: { changed?: boolean } = {};
+  try {
+    stampPut(cur.state, state, {
+      overRead: opts.baseRev != null && opts.baseRev === curRev,
+      stamped: opts.stamped === true,
+      // The JSDoc types report as null; upstream passes an object it fills in.
+      report: report as never,
+    });
+  } catch (e) {
+    if (e instanceof RangeError) return { status: 400, body: { error: 'invalid state' } };
+    throw e;
+  }
+
+  // Upstream answers curRev + 1 but stores curRev + 2 when the server put something back, so a
+  // writer that does not stamp sees the revision move on its next check and reads the profile.
   const nextRev = curRev + 1;
+  const storedRev = report.changed ? curRev + 2 : nextRev;
   const wid = randomHex(8);
   const prevWids = Array.isArray(cur.state?._wids) ? (cur.state?._wids as unknown[]) : [];
   const wids = [...prevWids, ...(cur.wid ? [cur.wid] : [])]
     .filter((x): x is string => typeof x === 'string')
     .slice(-WID_KEEP);
 
-  state._rev = nextRev;
-  state._wid = wid;
+  state._rev = storedRev;
   state._wids = wids;
-  if (!state._ts) state._ts = Date.now();
+  state._wid = wid;
 
-  const serialized = JSON.stringify(state);
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(state);
+  } catch (e) {
+    if (e instanceof RangeError) return { status: 400, body: { error: 'invalid state' } };
+    throw e;
+  }
   const now = Date.now();
 
   if (cur.state === null && curRev === 0) {
@@ -100,7 +127,7 @@ export async function commitUserState(
       `INSERT OR IGNORE INTO user_states (uid, rev, wid, state_json, updated_at)
        VALUES (?, ?, ?, ?, ?)`
     )
-      .bind(uid, nextRev, wid, serialized, now)
+      .bind(uid, storedRev, wid, serialized, now)
       .run();
 
     if (!ins.meta.changes) {
@@ -121,7 +148,7 @@ export async function commitUserState(
        SET rev = ?, wid = ?, state_json = ?, updated_at = ?
        WHERE uid = ? AND rev = ?`
     )
-      .bind(nextRev, wid, serialized, now, uid, curRev)
+      .bind(storedRev, wid, serialized, now, uid, curRev)
       .run();
 
     if (!upd.meta.changes) {
@@ -169,9 +196,11 @@ dataRoutes.put('/api/data', async (c) => {
   const s = await getSessionFromRequest(c.env, c.req.raw);
   if (!s) return c.json({ error: 'not signed in' }, 401);
   const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
-  if (!body || !body.state || typeof body.state !== 'object' || Array.isArray(body.state)) {
+  if (!body || !body.state || typeof body.state !== 'object') {
     return c.json({ error: 'state required' }, 400);
   }
+  // An array is a document loss of its own (upstream: 'invalid state').
+  if (Array.isArray(body.state)) return c.json({ error: 'invalid state' }, 400);
   const incoming = body.state as Record<string, unknown>;
   if (!Object.keys(incoming).some((k) => k !== '_rev' && k !== '_ts')) {
     return c.json({ error: 'state required' }, 400);
@@ -183,10 +212,26 @@ dataRoutes.put('/api/data', async (c) => {
   if (Array.isArray(incoming.workouts)) incoming.workouts = sanitizeRecords(incoming.workouts);
   if (Array.isArray(incoming.routines)) incoming.routines = sanitizeRecords(incoming.routines);
 
-  const cur = await readUserState(c.env, s.user.uid);
-  const res = await commitUserState(c.env, c.executionCtx, s.user.uid, cur, incoming, {
-    baseRev: typeof body.baseRev === 'number' ? body.baseRev : null,
+  // Any baseRev counts as one, as upstream's `!= null` does: a malformed one is a conflict, never
+  // a silent overwrite.
+  const baseRev = body.baseRev == null ? null : (body.baseRev as number);
+  const opts = {
+    baseRev,
     baseWid: typeof body.baseWid === 'string' ? body.baseWid : null,
-  });
+    stamped: body.stamped === true,
+  };
+  let cur = await readUserState(c.env, s.user.uid);
+  let res = await commitUserState(c.env, c.executionCtx, s.user.uid, cur, { ...incoming }, opts);
+  // No baseRev (a deliberate replace, such as a backup import) overwrites, as upstream does: a
+  // write landing between this read and that write is not a conflict to report. One more try.
+  if (res.status === 409 && baseRev == null) {
+    cur = await readUserState(c.env, s.user.uid);
+    res = await commitUserState(c.env, c.executionCtx, s.user.uid, cur, { ...incoming }, opts);
+  }
+  // Upstream's 409 here carries no `wid` (the client reads it off the document).
+  if (res.status === 409) {
+    const { wid: _wid, ...body409 } = res.body as Record<string, unknown>;
+    return c.json(body409, 409);
+  }
   return c.json(res.body, res.status);
 });

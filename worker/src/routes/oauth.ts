@@ -553,10 +553,10 @@ oauthRoutes.post('/api/oauth/token', async (c) => {
     const nextRefreshHash = await hashRefreshToken(nextRefresh);
     const nextAccessExp = Math.min(now + ACCESS_TTL_MS, row.expires_at ?? Infinity);
 
-    await c.env.DB.prepare(
+    const rotated = await c.env.DB.prepare(
       `UPDATE api_tokens
        SET token_sha256 = ?, hint = ?, refresh_sha256 = ?, prev_refresh_sha256 = ?, rotated_at = ?, access_expires_at = ?, last_used_at = ?
-       WHERE id = ?`
+       WHERE id = ? AND refresh_sha256 = ?`
     )
       .bind(
         nextAccessHash,
@@ -566,9 +566,15 @@ oauthRoutes.post('/api/oauth/token', async (c) => {
         now,
         nextAccessExp,
         now,
-        row.id
+        row.id,
+        row.refresh_sha256
       )
       .run();
+    // Another refresh of this connection rotated it in between: this answer would hand out a
+    // pair that no longer exists.
+    if (!rotated.meta.changes) {
+      return c.json({ error: 'invalid_grant', error_description: 'the refresh token is unknown, used or revoked' }, 400, headers);
+    }
 
     return c.json(
       {
@@ -595,12 +601,16 @@ oauthRoutes.post('/api/oauth/revoke', async (c) => {
   const token = form.get('token') || '';
   if (token.startsWith(REFRESH_PREFIX)) {
     const rhash = await hashRefreshToken(token);
-    await c.env.DB.prepare('DELETE FROM api_tokens WHERE refresh_sha256 = ? OR prev_refresh_sha256 = ?')
+    await c.env.DB.prepare(
+      'DELETE FROM api_tokens WHERE connector_json IS NOT NULL AND (refresh_sha256 = ? OR prev_refresh_sha256 = ?)'
+    )
       .bind(rhash, rhash)
       .run();
   } else if (token.startsWith(TOKEN_PREFIX)) {
     const thash = await hashApiToken(token);
-    await c.env.DB.prepare('DELETE FROM api_tokens WHERE token_sha256 = ?').bind(thash).run();
+    // Only a connector's own token (api/oauth.js revocable): a token made in Settings is ended
+    // there, never by whoever holds it.
+    await c.env.DB.prepare('DELETE FROM api_tokens WHERE connector_json IS NOT NULL AND token_sha256 = ?').bind(thash).run();
   }
   return c.body(null, 200, { 'Cache-Control': 'no-store' });
 });
